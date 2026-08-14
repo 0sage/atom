@@ -48,7 +48,10 @@ def _resolve_version() -> str:
         return _pkg_version("atom")
     except PackageNotFoundError:
         # Source checkouts often import atom without installed dist-info.
-        return _read_pyproject_version() or "0.3.0"
+        # The last resort says "unknown" rather than naming a version: a
+        # hardcoded number here would silently drift from pyproject.toml and
+        # report a version that was never installed.
+        return _read_pyproject_version() or "0+unknown"
 
 
 __version__ = _resolve_version()
