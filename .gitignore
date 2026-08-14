@@ -10,6 +10,11 @@
 # Claude / AI assistant artifacts
 docs/superpowers/
 docs/plans/
+# Per-machine assistant memory. ~/.claude/projects/<slug>/memory symlinks here,
+# so these are personal working notes that happen to live under the repo root.
+# Scoped to memory/ rather than all of .claude/, which may later hold shared
+# agent or command definitions that are worth committing.
+.claude/memory/
 
 # Python bytecode & caches
 *.pyc
