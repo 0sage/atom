@@ -5,7 +5,7 @@
 
 # atom
 
-🐈 **atom** is a self-hosted personal AI agent runtime written in Python. It runs in
+**atom** is a self-hosted personal AI agent runtime written in Python. It runs in
 your terminal or in Telegram, and keeps a small readable core: an agent loop, a
 provider layer, tools, session memory, and a gateway process.
 
