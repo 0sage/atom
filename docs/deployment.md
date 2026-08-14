@@ -89,6 +89,20 @@ Install, enable, and start it:
 atom gateway install-service --manager systemd
 ```
 
+`install-service` only writes and starts the unit; it does not check that the
+gateway can actually run. With no provider configured the unit installs
+successfully and then crashloops, since `Restart=always` retries a startup that
+refuses every time:
+
+```
+Active: activating (auto-restart) (Result: exit-code)
+Process: ... (code=exited, status=1/FAILURE)
+```
+
+Run `systemctl --user status atom-gateway` after installing. If you see that, run
+`atom status` — the reason it refused is printed there, not in the unit's output.
+This is why the checks above come first.
+
 For a custom instance, pass the same config/workspace selector you use to run the gateway:
 
 ```bash
@@ -106,6 +120,15 @@ systemctl --user status atom-gateway        # check status
 systemctl --user restart atom-gateway       # restart after config changes
 journalctl --user -u atom-gateway -f        # follow logs
 atom gateway uninstall-service --manager systemd
+```
+
+If `journalctl --user` reports `No journal files were found`, the host is not
+writing per-user journals (some minimal images ship without them). The unit's own
+lines are still in the system journal, and `status` shows the most recent output:
+
+```bash
+sudo journalctl -u atom-gateway -f
+systemctl --user status atom-gateway
 ```
 
 The installer writes `~/.config/systemd/user/atom-gateway.service`, runs
@@ -126,11 +149,48 @@ it fails with `No such file or directory: 'systemctl'`. Use the built-in
 background mode there, supervised by whatever init the host actually runs:
 
 ```bash
-atom gateway --background      # start detached
-atom gateway status            # running?, PID, port
-atom gateway logs              # recent output
-atom gateway stop              # stop it
+atom gateway --background          # start detached
+atom gateway status                # running?, PID, port
+atom gateway logs --no-follow      # print recent output and exit
+atom gateway logs                  # follow new output (Ctrl-C to stop)
+atom gateway stop                  # stop it
 ```
+
+`atom gateway logs` follows by default and does not return on its own; pass
+`--no-follow` when you just want the tail, and `--tail N` to choose how much.
+
+`--background` detaches from your shell but nothing supervises it: **it does not
+survive a reboot.** After a restart, `atom gateway status` reports
+`Reason: stale_state` and the gateway is not running. To start it at boot, have
+the host's own init supervise `atom gateway --foreground`. An OpenRC service that
+does this:
+
+```sh
+# /etc/init.d/atom-gateway
+#!/sbin/openrc-run
+name="atom-gateway"
+command="/home/youruser/.local/bin/atom"
+command_args="gateway --foreground"
+command_user="youruser"
+command_background=true
+pidfile="/run/atom-gateway.pid"
+output_log="/var/log/atom-gateway.log"
+error_log="/var/log/atom-gateway.log"
+
+depend() {
+    need net
+}
+```
+
+```bash
+sudo chmod +x /etc/init.d/atom-gateway
+sudo rc-update add atom-gateway default
+sudo rc-service atom-gateway start
+```
+
+Use `--foreground` in the unit, not `--background`: OpenRC does its own
+daemonizing via `command_background`, and a process that forks again would escape
+supervision.
 
 ## macOS LaunchAgent
 
