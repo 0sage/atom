@@ -407,3 +407,51 @@ def test_scope_auto_falls_back_to_user_without_geteuid(tmp_path, monkeypatch):
     )
 
     assert result.path == tmp_path / ".config/systemd/user/atom-gateway.service"
+
+
+def test_systemd_unit_puts_the_tool_bin_dirs_on_path(tmp_path, monkeypatch):
+    """A service that cannot see `uv` cannot install an enabled channel's deps."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    installer = GatewayServiceInstaller(platform_name="Linux", home=tmp_path)
+
+    result = installer.install(
+        GatewayServiceOptions(
+            start=GatewayStartOptions(port=18790),
+            python_executable="/root/.local/share/uv/tools/atom/bin/python",
+        ),
+        dry_run=True,
+    )
+
+    assert result.content is not None
+    path_lines = [
+        line for line in result.content.splitlines() if line.startswith("Environment=PATH=")
+    ]
+    assert len(path_lines) == 1
+    value = path_lines[0].split("=", 2)[2].strip('"')
+    entries = value.split(":")
+    # The interpreter's own bin dir and ~/.local/bin must both precede the
+    # bare PATH systemd would otherwise hand the unit.
+    assert entries[0] == "/root/.local/share/uv/tools/atom/bin"
+    assert str(tmp_path / ".local/bin") in entries
+    assert "/usr/bin" in entries
+    assert entries.index(str(tmp_path / ".local/bin")) < entries.index("/usr/bin")
+    assert len(entries) == len(set(entries))  # no duplicates
+
+
+def test_launchd_plist_sets_the_same_path(tmp_path):
+    installer = GatewayServiceInstaller(platform_name="Darwin", home=tmp_path)
+
+    result = installer.install(
+        GatewayServiceOptions(
+            start=GatewayStartOptions(port=18790),
+            python_executable="/opt/tools/atom/bin/python3",
+        ),
+        dry_run=True,
+    )
+
+    assert result.content is not None
+    payload = plistlib.loads(result.content.encode("utf-8"))
+    env = payload["EnvironmentVariables"]
+    assert env["PYTHONUNBUFFERED"] == "1"
+    assert env["PATH"].split(":")[0] == "/opt/tools/atom/bin"
+    assert str(tmp_path / ".local/bin") in env["PATH"].split(":")

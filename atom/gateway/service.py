@@ -129,6 +129,7 @@ class GatewayServiceInstaller:
             command=command,
             working_directory=_working_directory_text(options.start),
             scope=scope,
+            path_value=_service_path_value(self.home, options.python_executable),
         )
         scope_flag = _systemd_scope_flag(scope)
         commands: list[tuple[str, ...]] = [("systemctl", *scope_flag, "daemon-reload")]
@@ -207,6 +208,13 @@ class GatewayServiceInstaller:
             "KeepAlive": {"SuccessfulExit": False},
             "StandardOutPath": str(stdout_path),
             "StandardErrorPath": str(stderr_path),
+            # launchd hands the job a minimal PATH too, so an enabled channel
+            # could not find `uv` to install its dependencies. Same reason as
+            # the systemd unit's Environment=PATH.
+            "EnvironmentVariables": {
+                "PYTHONUNBUFFERED": "1",
+                "PATH": _service_path_value(self.home, options.python_executable),
+            },
         }
         content = plistlib.dumps(payload, sort_keys=False).decode("utf-8")
         domain = _launchd_domain()
@@ -339,12 +347,35 @@ def _launchd_domain() -> str:
     return f"gui/{getuid()}"
 
 
+_DEFAULT_UNIT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _service_path_value(home: Path, python_executable: str) -> str:
+    """PATH for the service, with the tool bin directories in front.
+
+    systemd hands a unit a bare PATH that excludes ~/.local/bin, so a gateway
+    started as a service cannot see `uv`. Enabling a channel then fails where it
+    works interactively: the dependency install falls back to `ensurepip`, and a
+    uv-managed interpreter ships without it.
+    """
+    parts: list[str] = []
+    python_bin = Path(python_executable).parent
+    if python_bin.name:
+        parts.append(str(python_bin))
+    parts.append(str(home / ".local" / "bin"))
+    parts.extend(_DEFAULT_UNIT_PATH.split(":"))
+    seen: set[str] = set()
+    ordered = [p for p in parts if p and not (p in seen or seen.add(p))]
+    return ":".join(ordered)
+
+
 def _systemd_unit_content(
     *,
     description: str,
     command: list[str],
     working_directory: str,
     scope: str = "user",
+    path_value: str | None = None,
 ) -> str:
     quoted_command = " ".join(_systemd_quote(part) for part in command)
     lines = [
@@ -360,8 +391,10 @@ def _systemd_unit_content(
         "Restart=always",
         "RestartSec=10",
         "Environment=PYTHONUNBUFFERED=1",
-        "NoNewPrivileges=yes",
     ]
+    if path_value:
+        lines.append(f"Environment=PATH={_systemd_quote(path_value)}")
+    lines.append("NoNewPrivileges=yes")
     if scope == "system":
         # A user unit inherits the user; a system unit runs as root unless told
         # otherwise, and default.target is not a system target -- boot-time
