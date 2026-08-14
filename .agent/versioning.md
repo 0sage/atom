@@ -72,3 +72,22 @@ uv run --no-sync basedpyright     # 0 errors, 0 warnings, 0 notes
 .venv/bin/ruff check atom/
 .venv/bin/python -m pytest -q
 ```
+
+### Host testing is a release step, not a per-edit one
+
+While developing, run only the three checks above. Do not exercise the Lima VMs
+or the LXC containers for ordinary edits — each pass costs minutes in image
+pulls, package installs, `uv tool install`, and service restarts.
+
+Run the host sweep **once, immediately before pushing**, when the change could
+behave differently on a real host: anything touching install, the service
+installer, the gateway's process environment, or `scripts/install.sh`. Cover
+systemd as a normal user, systemd as root, and OpenRC, and confirm the service
+survives a reboot. Wipe the hosts first — leftover state makes a broken thing
+look fine, which is how an OpenRC recipe once passed only because an earlier run
+had created its logfile.
+
+Skipping the sweep entirely is fine for changes that cannot reach a host (tests,
+these docs, comments) — but say which one applies rather than implying a change
+was host-tested when it was not. If the sweep finds something, fix it and re-run
+before pushing.
