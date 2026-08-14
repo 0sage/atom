@@ -24,6 +24,7 @@ from atom.gateway.service import (
     GatewayServiceOptions,
     GatewayServiceResult,
     ServiceManagerKind,
+    ServiceScope,
 )
 
 RuntimeConfigLoader = Callable[[str | None, str | None], Config]
@@ -273,17 +274,23 @@ def create_gateway_app(
         config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
         name: str = typer.Option("atom-gateway", "--name", help="Service name"),
         manager: ServiceManagerKind = typer.Option("auto", "--manager", help="auto, systemd, or launchd"),
+        scope: ServiceScope = typer.Option(
+            "auto",
+            "--scope",
+            help="auto (system when root, user otherwise), user, or system",
+        ),
         enable: bool = typer.Option(True, "--enable/--no-enable", help="Enable the service after writing it"),
         start_now: bool = typer.Option(True, "--start/--no-start", help="Start the service after writing it"),
         dry_run: bool = typer.Option(False, "--dry-run", help="Print generated service without installing"),
     ) -> None:
-        """Install a systemd user service or macOS LaunchAgent for the gateway."""
+        """Install a systemd service or macOS LaunchAgent for the gateway."""
         options = GatewayServiceOptions(
             start=start_options(port=port, verbose=verbose, workspace=workspace, config=config),
             name=name,
             manager=manager,
             enable=enable,
             start_now=start_now,
+            scope=scope,
         )
         try:
             result = service_installer().install(options, dry_run=dry_run)
@@ -306,11 +313,18 @@ def create_gateway_app(
     def gateway_uninstall_service(  # pyright: ignore[reportUnusedFunction]
         name: str = typer.Option("atom-gateway", "--name", help="Service name"),
         manager: ServiceManagerKind = typer.Option("auto", "--manager", help="auto, systemd, or launchd"),
+        scope: ServiceScope = typer.Option(
+            "auto",
+            "--scope",
+            help="auto (system when root, user otherwise), user, or system",
+        ),
         dry_run: bool = typer.Option(False, "--dry-run", help="Print actions without uninstalling"),
     ) -> None:
         """Uninstall the system gateway service."""
         try:
-            result = service_installer().uninstall(name=name, manager=manager, dry_run=dry_run)
+            result = service_installer().uninstall(
+                name=name, manager=manager, dry_run=dry_run, scope=scope
+            )
         except subprocess.CalledProcessError as exc:
             console.print(f"[red]Service uninstall failed while running: {' '.join(exc.cmd)}[/red]")
             raise typer.Exit(exc.returncode or 1) from exc

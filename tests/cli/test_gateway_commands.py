@@ -61,6 +61,7 @@ class FakeServiceInstaller:
         self.install_dry_run: bool | None = None
         self.uninstalled_name: str | None = None
         self.uninstall_manager: str | None = None
+        self.uninstall_scope: str | None = None
 
     def install(self, options: GatewayServiceOptions, *, dry_run: bool) -> GatewayServiceResult:
         self.installed_options = options
@@ -74,9 +75,12 @@ class FakeServiceInstaller:
             "[Unit]\nDescription=Atom Gateway\n",
         )
 
-    def uninstall(self, *, name: str, manager: str, dry_run: bool) -> GatewayServiceResult:
+    def uninstall(
+        self, *, name: str, manager: str, dry_run: bool, scope: str = "auto"
+    ) -> GatewayServiceResult:
         self.uninstalled_name = name
         self.uninstall_manager = manager
+        self.uninstall_scope = scope
         return GatewayServiceResult(
             True,
             "service_uninstall_dry_run" if dry_run else "service_uninstalled",

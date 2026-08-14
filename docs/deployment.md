@@ -28,6 +28,20 @@ the git URL.
 uv tool install "git+https://github.com/0sage/atom.git"
 ```
 
+On a bare host — a fresh container or VM with no `uv`, and possibly no `git`,
+`curl`, or `tar` — `scripts/install.sh` handles the prerequisites first:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/0sage/atom/main/scripts/install.sh
+sh install.sh --check       # report what is missing, change nothing
+sh install.sh --ref v0.3.4  # install for the user running it
+```
+
+It installs missing packages (using `sudo` when not root), then `uv`, then atom,
+and stops there. It deliberately does not run `atom onboard` or register a
+service — it prints the commands for those instead. Read it before running it;
+it is POSIX `sh` and does what the two paragraphs above describe.
+
 Pin a tag or commit for a reproducible deployment, and declare optional
 dependencies up front with `--with` so `uv tool upgrade` cannot drop them:
 
@@ -75,7 +89,7 @@ requirements with `--with` for a deployment you intend to upgrade.
 
 ## Linux Service
 
-Run the gateway as a systemd user service so it starts automatically and restarts on failure.
+Run the gateway as a systemd service so it starts automatically and restarts on failure.
 
 Preview the generated unit first:
 
@@ -89,6 +103,32 @@ Install, enable, and start it:
 atom gateway install-service --manager systemd
 ```
 
+### User unit or system unit
+
+The unit is written for whoever runs the command:
+
+| Running as | Unit | Path | Manage with |
+|---|---|---|---|
+| a normal user | user unit | `~/.config/systemd/user/atom-gateway.service` | `systemctl --user ...` |
+| root | system unit | `/etc/systemd/system/atom-gateway.service` | `systemctl ...` |
+
+Root gets a system unit because it has to. On a container or a headless box root
+has no login session, so `systemctl --user` fails with `Failed to connect to bus:
+No medium found` — a user unit installed as root could never start. A system unit
+also runs at boot without lingering, which is usually what root wanted anyway.
+
+Override the choice with `--scope` when the default is wrong — a system unit
+installed with `sudo` for a service that should outlive any login, or a user unit
+while logged in as root:
+
+```bash
+sudo atom gateway install-service --scope system
+atom gateway install-service --scope user
+```
+
+`--scope` applies to `uninstall-service` too, and must match what you installed;
+otherwise it looks for a unit in the other location and finds nothing.
+
 `install-service` only writes and starts the unit; it does not check that the
 gateway can actually run. With no provider configured the unit installs
 successfully and then crashloops, since `Restart=always` retries a startup that
@@ -99,9 +139,9 @@ Active: activating (auto-restart) (Result: exit-code)
 Process: ... (code=exited, status=1/FAILURE)
 ```
 
-Run `systemctl --user status atom-gateway` after installing. If you see that, run
-`atom status` — the reason it refused is printed there, not in the unit's output.
-This is why the checks above come first.
+Run `systemctl --user status atom-gateway` after installing (drop `--user` if you
+installed as root). If you see that, run `atom status` — the reason it refused is
+printed there, not in the unit's output. This is why the checks above come first.
 
 For a custom instance, pass the same config/workspace selector you use to run the gateway:
 
@@ -113,7 +153,8 @@ atom gateway install-service \
   --workspace ~/.atom-telegram/workspace
 ```
 
-Common operations:
+Common operations for a user unit — drop `--user` from every line if you
+installed as root:
 
 ```bash
 systemctl --user status atom-gateway        # check status
@@ -131,16 +172,18 @@ sudo journalctl -u atom-gateway -f
 systemctl --user status atom-gateway
 ```
 
-The installer writes `~/.config/systemd/user/atom-gateway.service`, runs
-`systemctl --user daemon-reload`, enables the unit, and restarts it. It uses the
-current Python executable with `python -m atom gateway --foreground`, so the
-service runs in the same environment you used to install atom.
+The installer writes the unit to the path in the table above, runs
+`daemon-reload`, enables the unit, and restarts it. It uses the current Python
+executable with `python -m atom gateway --foreground`, so the service runs in the
+same environment you used to install atom.
 
 > **Note:** User services only run while you are logged in. To keep the gateway running after logout, enable lingering:
 >
 > ```bash
 > loginctl enable-linger $USER
 > ```
+>
+> System units (installed as root) run at boot and need no lingering.
 
 ## Hosts Without systemd
 

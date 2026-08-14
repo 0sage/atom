@@ -1,6 +1,7 @@
 import os
 import plistlib
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -330,3 +331,79 @@ def test_systemd_install_restores_previous_unit_when_a_command_fails(tmp_path):
         installer.install(GatewayServiceOptions(start=GatewayStartOptions(port=18790)))
 
     assert unit.read_text(encoding="utf-8") == "[Unit]\nDescription=the one that worked\n"
+
+
+def test_root_gets_a_system_unit_not_a_user_unit(tmp_path, monkeypatch):
+    """Root has no login session, so `systemctl --user` cannot work for it."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    installer = GatewayServiceInstaller(platform_name="Linux", home=tmp_path)
+
+    result = installer.install(
+        GatewayServiceOptions(start=GatewayStartOptions(port=18790)),
+        dry_run=True,
+    )
+
+    assert result.ok is True
+    assert result.path == Path("/etc/systemd/system/atom-gateway.service")
+    assert ("systemctl", "daemon-reload") in result.commands
+    assert not any("--user" in command for command in result.commands)
+    assert result.content is not None
+    assert "WantedBy=multi-user.target" in result.content
+
+
+def test_non_root_still_gets_a_user_unit(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    installer = GatewayServiceInstaller(platform_name="Linux", home=tmp_path)
+
+    result = installer.install(
+        GatewayServiceOptions(start=GatewayStartOptions(port=18790)),
+        dry_run=True,
+    )
+
+    assert result.path == tmp_path / ".config/systemd/user/atom-gateway.service"
+    assert ("systemctl", "--user", "daemon-reload") in result.commands
+    assert result.content is not None
+    assert "WantedBy=default.target" in result.content
+
+
+def test_explicit_scope_overrides_the_euid_guess(tmp_path, monkeypatch):
+    """An operator may want a system unit as non-root (with sudo), or vice versa."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    installer = GatewayServiceInstaller(platform_name="Linux", home=tmp_path)
+
+    system = installer.install(
+        GatewayServiceOptions(start=GatewayStartOptions(port=18790), scope="system"),
+        dry_run=True,
+    )
+    assert system.path == Path("/etc/systemd/system/atom-gateway.service")
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    user = installer.install(
+        GatewayServiceOptions(start=GatewayStartOptions(port=18790), scope="user"),
+        dry_run=True,
+    )
+    assert user.path == tmp_path / ".config/systemd/user/atom-gateway.service"
+    assert ("systemctl", "--user", "daemon-reload") in user.commands
+
+
+def test_uninstall_targets_the_same_scope_install_chose(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    installer = GatewayServiceInstaller(platform_name="Linux", home=tmp_path)
+
+    result = installer.uninstall(dry_run=True)
+
+    assert result.path == Path("/etc/systemd/system/atom-gateway.service")
+    assert not any("--user" in command for command in result.commands)
+
+
+def test_scope_auto_falls_back_to_user_without_geteuid(tmp_path, monkeypatch):
+    """Windows has no geteuid; guessing "system" there would be wrong."""
+    monkeypatch.delattr(os, "geteuid", raising=False)
+    installer = GatewayServiceInstaller(platform_name="Linux", home=tmp_path)
+
+    result = installer.install(
+        GatewayServiceOptions(start=GatewayStartOptions(port=18790)),
+        dry_run=True,
+    )
+
+    assert result.path == tmp_path / ".config/systemd/user/atom-gateway.service"

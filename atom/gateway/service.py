@@ -16,6 +16,7 @@ from typing import Any, Literal
 from atom.gateway import GatewayStartOptions, build_gateway_command
 
 ServiceManagerKind = Literal["auto", "systemd", "launchd"]
+ServiceScope = Literal["auto", "user", "system"]
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class GatewayServiceOptions:
     enable: bool = True
     start_now: bool = True
     python_executable: str = sys.executable
+    scope: ServiceScope = "auto"
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,21 @@ class GatewayServiceInstaller:
         self._subprocess_run = subprocess_run
         self.home = home or Path.home()
         self._which = which
+
+    def _resolve_scope(self, scope: ServiceScope) -> str:
+        """Pick a user unit or a system unit.
+
+        Root has no login session in a container or on a headless box, so
+        `systemctl --user` fails with "Failed to connect to bus: No medium
+        found". A system unit is the only form root can actually start, and it
+        is also what root usually wants: it runs at boot without lingering.
+        """
+        if scope != "auto":
+            return scope
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is not None and geteuid() == 0:
+            return "system"
+        return "user"
 
     def _require_tool(self, tool: str, manager: str) -> GatewayServiceResult | None:
         """Refuse before touching the filesystem when the manager is not installed.
@@ -88,10 +105,11 @@ class GatewayServiceInstaller:
         name: str = "atom-gateway",
         manager: ServiceManagerKind = "auto",
         dry_run: bool = False,
+        scope: ServiceScope = "auto",
     ) -> GatewayServiceResult:
         resolved = self._resolve_manager(manager)
         if resolved == "systemd":
-            return self._uninstall_systemd(name=name, dry_run=dry_run)
+            return self._uninstall_systemd(name=name, dry_run=dry_run, scope=scope)
         if resolved == "launchd":
             return self._uninstall_launchd(name=name, dry_run=dry_run)
         return GatewayServiceResult(False, f"unsupported_service_manager:{resolved}", resolved, None)
@@ -103,18 +121,21 @@ class GatewayServiceInstaller:
         dry_run: bool,
     ) -> GatewayServiceResult:
         unit_name = _systemd_unit_name(options.name)
-        path = self.home / ".config" / "systemd" / "user" / unit_name
+        scope = self._resolve_scope(options.scope)
+        path = _systemd_unit_path(self.home, unit_name, scope)
         command = build_gateway_command(options.python_executable, options.start)
         content = _systemd_unit_content(
             description=f"Atom Gateway ({options.name})",
             command=command,
             working_directory=_working_directory_text(options.start),
+            scope=scope,
         )
-        commands: list[tuple[str, ...]] = [("systemctl", "--user", "daemon-reload")]
+        scope_flag = _systemd_scope_flag(scope)
+        commands: list[tuple[str, ...]] = [("systemctl", *scope_flag, "daemon-reload")]
         if options.enable:
-            commands.append(("systemctl", "--user", "enable", unit_name))
+            commands.append(("systemctl", *scope_flag, "enable", unit_name))
         if options.start_now:
-            commands.append(("systemctl", "--user", "restart", unit_name))
+            commands.append(("systemctl", *scope_flag, "restart", unit_name))
         if dry_run:
             return GatewayServiceResult(True, "service_install_dry_run", "systemd", path, tuple(commands), content)
 
@@ -145,12 +166,15 @@ class GatewayServiceInstaller:
         *,
         name: str,
         dry_run: bool,
+        scope: ServiceScope = "auto",
     ) -> GatewayServiceResult:
         unit_name = _systemd_unit_name(name)
-        path = self.home / ".config" / "systemd" / "user" / unit_name
+        resolved_scope = self._resolve_scope(scope)
+        path = _systemd_unit_path(self.home, unit_name, resolved_scope)
+        scope_flag = _systemd_scope_flag(resolved_scope)
         commands = (
-            ("systemctl", "--user", "disable", "--now", unit_name),
-            ("systemctl", "--user", "daemon-reload"),
+            ("systemctl", *scope_flag, "disable", "--now", unit_name),
+            ("systemctl", *scope_flag, "daemon-reload"),
         )
         if dry_run:
             return GatewayServiceResult(True, "service_uninstall_dry_run", "systemd", path, commands)
@@ -282,6 +306,18 @@ def _systemd_unit_name(name: str) -> str:
     return stem if stem.endswith(".service") else f"{stem}.service"
 
 
+def _systemd_scope_flag(scope: str) -> tuple[str, ...]:
+    """`--user` for a user unit; nothing at all for a system unit."""
+    return () if scope == "system" else ("--user",)
+
+
+def _systemd_unit_path(home: Path, unit_name: str, scope: str) -> Path:
+    """System units live outside any home directory."""
+    if scope == "system":
+        return Path("/etc/systemd/system") / unit_name
+    return home / ".config" / "systemd" / "user" / unit_name
+
+
 def _launchd_label(name: str) -> str:
     if name.startswith("ai.atom."):
         return name
@@ -308,29 +344,32 @@ def _systemd_unit_content(
     description: str,
     command: list[str],
     working_directory: str,
+    scope: str = "user",
 ) -> str:
     quoted_command = " ".join(_systemd_quote(part) for part in command)
-    return "\n".join(
-        [
-            "[Unit]",
-            f"Description={description}",
-            "After=network-online.target",
-            "Wants=network-online.target",
-            "",
-            "[Service]",
-            "Type=simple",
-            f"WorkingDirectory={_systemd_quote(str(working_directory))}",
-            f"ExecStart={quoted_command}",
-            "Restart=always",
-            "RestartSec=10",
-            "Environment=PYTHONUNBUFFERED=1",
-            "NoNewPrivileges=yes",
-            "",
-            "[Install]",
-            "WantedBy=default.target",
-            "",
-        ]
-    )
+    lines = [
+        "[Unit]",
+        f"Description={description}",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        f"WorkingDirectory={_systemd_quote(str(working_directory))}",
+        f"ExecStart={quoted_command}",
+        "Restart=always",
+        "RestartSec=10",
+        "Environment=PYTHONUNBUFFERED=1",
+        "NoNewPrivileges=yes",
+    ]
+    if scope == "system":
+        # A user unit inherits the user; a system unit runs as root unless told
+        # otherwise, and default.target is not a system target -- boot-time
+        # system units want multi-user.target.
+        lines.extend(["", "[Install]", "WantedBy=multi-user.target", ""])
+    else:
+        lines.extend(["", "[Install]", "WantedBy=default.target", ""])
+    return "\n".join(lines)
 
 
 def _systemd_quote(value: str) -> str:
