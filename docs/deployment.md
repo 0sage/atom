@@ -180,7 +180,16 @@ error_log="/var/log/atom-gateway.log"
 depend() {
     need net
 }
+
+start_pre() {
+    checkpath --file --owner "$command_user" --mode 0644 "$output_log"
+}
 ```
+
+The `start_pre` is required, not optional. `start-stop-daemon` drops to
+`command_user` before opening the log, so without it the first start fails with
+`unable to open the logfile for stdout ... Permission denied` and the service
+reports `crashed` — on the first start only, since after that the file exists.
 
 ```bash
 sudo chmod +x /etc/init.d/atom-gateway
