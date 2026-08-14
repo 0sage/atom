@@ -16,9 +16,26 @@ uv sync --all-extras --dev
 uv run --no-sync python -m scripts.install_channel_dependencies --all-channels
 uv run --no-sync basedpyright
 
+# Version (never hand-edit pyproject.toml's version)
+python -m scripts.bump_version --check
+python -m scripts.bump_version patch|minor|major
+
 # Gateway
 atom gateway
 ```
+
+## Releasing
+
+Every pushed commit carries a version bump, made in that same commit, so
+`atom --version` always identifies exactly one tree. `X.Y.Z`, one component per
+release, always by one: `major` breaks a working setup, `minor` adds capability
+that keeps it working, `patch` makes existing behavior more correct. Changes an
+operator cannot see (tests, `.agent/` docs, comments) are still `patch`.
+
+Never hand-edit the version; `scripts/bump_version.py` is the only writer and it
+rejects multi-step jumps and backwards moves. Push with `--follow-tags` so the
+tag never lags the commit. Full rules, the ambiguous cases, and the release
+sequence: [`.agent/versioning.md`](.agent/versioning.md).
 
 ## High-Level Architecture
 
