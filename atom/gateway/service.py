@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -50,10 +51,28 @@ class GatewayServiceInstaller:
         platform_name: str | None = None,
         subprocess_run: Callable[..., Any] = subprocess.run,
         home: Path | None = None,
+        which: Callable[[str], str | None] = shutil.which,
     ) -> None:
         self.platform_name = platform_name or _platform_name()
         self._subprocess_run = subprocess_run
         self.home = home or Path.home()
+        self._which = which
+
+    def _require_tool(self, tool: str, manager: str) -> GatewayServiceResult | None:
+        """Refuse before touching the filesystem when the manager is not installed.
+
+        Alpine and other OpenRC hosts have no `systemctl`. Writing the unit first
+        and discovering that only when the command fails leaves an orphan unit
+        behind that nothing will ever start.
+        """
+        if self._which(tool) is not None:
+            return None
+        return GatewayServiceResult(
+            False,
+            f"service_manager_unavailable:{tool}",
+            manager,
+            None,
+        )
 
     def install(self, options: GatewayServiceOptions, *, dry_run: bool = False) -> GatewayServiceResult:
         manager = self._resolve_manager(options.manager)
@@ -99,11 +118,26 @@ class GatewayServiceInstaller:
         if dry_run:
             return GatewayServiceResult(True, "service_install_dry_run", "systemd", path, tuple(commands), content)
 
+        unavailable = self._require_tool("systemctl", "systemd")
+        if unavailable is not None:
+            return unavailable
+
         _working_directory(options.start).mkdir(parents=True, exist_ok=True)
         path.parent.mkdir(parents=True, exist_ok=True)
+        existed = path.exists()
+        previous = path.read_text(encoding="utf-8") if existed else None
         path.write_text(content, encoding="utf-8")
-        for command_args in commands:
-            self._subprocess_run(list(command_args), check=True)
+        try:
+            for command_args in commands:
+                self._subprocess_run(list(command_args), check=True)
+        except BaseException:
+            # Leave no unit that nothing will start: restore what was there, or
+            # remove the file we just created.
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(previous, encoding="utf-8")
+            raise
         return GatewayServiceResult(True, "service_installed", "systemd", path, tuple(commands), content)
 
     def _uninstall_systemd(
@@ -120,6 +154,10 @@ class GatewayServiceInstaller:
         )
         if dry_run:
             return GatewayServiceResult(True, "service_uninstall_dry_run", "systemd", path, commands)
+
+        unavailable = self._require_tool("systemctl", "systemd")
+        if unavailable is not None:
+            return unavailable
 
         self._run_best_effort(commands[0])
         path.unlink(missing_ok=True)
@@ -158,14 +196,27 @@ class GatewayServiceInstaller:
         if dry_run:
             return GatewayServiceResult(True, "service_install_dry_run", "launchd", path, tuple(commands), content)
 
+        unavailable = self._require_tool("launchctl", "launchd")
+        if unavailable is not None:
+            return unavailable
+
         _working_directory(options.start).mkdir(parents=True, exist_ok=True)
         path.parent.mkdir(parents=True, exist_ok=True)
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        existed = path.exists()
+        previous = path.read_text(encoding="utf-8") if existed else None
         path.write_text(content, encoding="utf-8")
         if options.start_now:
             self._run_best_effort(("launchctl", "bootout", domain, str(path)))
-        for command_args in commands:
-            self._subprocess_run(list(command_args), check=True)
+        try:
+            for command_args in commands:
+                self._subprocess_run(list(command_args), check=True)
+        except BaseException:
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(previous, encoding="utf-8")
+            raise
         return GatewayServiceResult(True, "service_installed", "launchd", path, tuple(commands), content)
 
     def _uninstall_launchd(
@@ -183,6 +234,10 @@ class GatewayServiceInstaller:
         )
         if dry_run:
             return GatewayServiceResult(True, "service_uninstall_dry_run", "launchd", path, commands)
+
+        unavailable = self._require_tool("launchctl", "launchd")
+        if unavailable is not None:
+            return unavailable
 
         for command_args in commands:
             self._run_best_effort(command_args)

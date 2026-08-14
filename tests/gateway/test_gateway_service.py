@@ -1,8 +1,21 @@
 import os
 import plistlib
+import subprocess
+
+import pytest
 
 from atom.gateway import GatewayStartOptions
 from atom.gateway.service import GatewayServiceInstaller, GatewayServiceOptions
+
+
+def _tool_present(_tool: str) -> str:
+    """Pretend the service manager is installed.
+
+    The installer now refuses before writing anything when its manager is
+    absent, so tests that simulate a host must say the tool is there. Without
+    this, the systemd cases fail on macOS and the launchd cases fail on Linux.
+    """
+    return f"/usr/bin/{_tool}"
 
 
 def _expected_launchd_domain() -> str:
@@ -47,6 +60,7 @@ def test_systemd_install_writes_unit_and_runs_commands(tmp_path):
         platform_name="Linux",
         home=tmp_path,
         subprocess_run=lambda command, **_kwargs: commands.append(command),
+        which=_tool_present,
     )
 
     result = installer.install(
@@ -153,6 +167,7 @@ def test_launchd_no_enable_start_reinstall_boots_out_existing_label(tmp_path):
         platform_name="Darwin",
         home=tmp_path,
         subprocess_run=lambda command, **_kwargs: commands.append(command),
+        which=_tool_present,
     )
 
     result = installer.install(
@@ -187,6 +202,7 @@ def test_uninstall_systemd_removes_unit_and_reloads(tmp_path):
         platform_name="Linux",
         home=tmp_path,
         subprocess_run=lambda command, **_kwargs: commands.append(command),
+        which=_tool_present,
     )
     unit = tmp_path / ".config/systemd/user/atom-gateway.service"
     unit.parent.mkdir(parents=True)
@@ -212,3 +228,105 @@ def test_auto_manager_rejects_unsupported_platform(tmp_path):
 
     assert result.ok is False
     assert result.message == "unsupported_service_manager:freebsd"
+
+
+def _tool_absent(_tool: str) -> None:
+    """Simulate a host without the service manager (Alpine has no systemctl)."""
+    return None
+
+
+def test_systemd_install_refuses_before_writing_when_systemctl_is_absent(tmp_path):
+    """The orphan-unit bug: writing first left a unit nothing would ever start."""
+    commands: list[list[str]] = []
+    installer = GatewayServiceInstaller(
+        platform_name="Linux",
+        home=tmp_path,
+        subprocess_run=lambda command, **_kwargs: commands.append(command),
+        which=_tool_absent,
+    )
+
+    result = installer.install(
+        GatewayServiceOptions(start=GatewayStartOptions(port=18790))
+    )
+
+    assert result.ok is False
+    assert result.message == "service_manager_unavailable:systemctl"
+    assert commands == []
+    assert not (tmp_path / ".config/systemd/user/atom-gateway.service").exists()
+
+
+def test_launchd_install_refuses_before_writing_when_launchctl_is_absent(tmp_path):
+    installer = GatewayServiceInstaller(
+        platform_name="Darwin",
+        home=tmp_path,
+        subprocess_run=lambda *_a, **_k: None,
+        which=_tool_absent,
+    )
+
+    result = installer.install(
+        GatewayServiceOptions(start=GatewayStartOptions(port=18790))
+    )
+
+    assert result.ok is False
+    assert result.message == "service_manager_unavailable:launchctl"
+    assert not (tmp_path / "Library/LaunchAgents/ai.atom.gateway.plist").exists()
+
+
+def test_systemd_uninstall_refuses_when_systemctl_is_absent(tmp_path):
+    """Uninstall's daemon-reload uses check=True, so it would raise on Alpine."""
+    unit = tmp_path / ".config/systemd/user/atom-gateway.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Unit]\n", encoding="utf-8")
+    installer = GatewayServiceInstaller(
+        platform_name="Linux",
+        home=tmp_path,
+        subprocess_run=lambda *_a, **_k: None,
+        which=_tool_absent,
+    )
+
+    result = installer.uninstall()
+
+    assert result.ok is False
+    assert result.message == "service_manager_unavailable:systemctl"
+    assert unit.exists()  # left alone rather than half-removed
+
+
+def test_systemd_install_removes_new_unit_when_a_command_fails(tmp_path):
+    """A failing systemctl must not leave a unit behind that was never enabled."""
+
+    def _boom(command, **_kwargs):
+        raise subprocess.CalledProcessError(1, command)
+
+    installer = GatewayServiceInstaller(
+        platform_name="Linux",
+        home=tmp_path,
+        subprocess_run=_boom,
+        which=_tool_present,
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        installer.install(GatewayServiceOptions(start=GatewayStartOptions(port=18790)))
+
+    assert not (tmp_path / ".config/systemd/user/atom-gateway.service").exists()
+
+
+def test_systemd_install_restores_previous_unit_when_a_command_fails(tmp_path):
+    """A failed reinstall must not destroy the unit that was already working."""
+    unit = tmp_path / ".config/systemd/user/atom-gateway.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Unit]\nDescription=the one that worked\n", encoding="utf-8")
+
+    def _boom(command, **_kwargs):
+        raise subprocess.CalledProcessError(1, command)
+
+    installer = GatewayServiceInstaller(
+        platform_name="Linux",
+        home=tmp_path,
+        subprocess_run=_boom,
+        which=_tool_present,
+    )
+
+    with pytest.raises(subprocess.CalledProcessError):
+        installer.install(GatewayServiceOptions(start=GatewayStartOptions(port=18790)))
+
+    assert unit.read_text(encoding="utf-8") == "[Unit]\nDescription=the one that worked\n"

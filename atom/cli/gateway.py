@@ -113,6 +113,20 @@ def create_gateway_app(
         console.print(f"State: {status.state_path}")
         console.print(f"Logs: {status.log_path}")
 
+    def print_service_hint(result: GatewayServiceResult) -> None:
+        """Turn a machine-readable failure code into the next thing to try."""
+        if not result.message.startswith("service_manager_unavailable:"):
+            return
+        tool = result.message.partition(":")[2]
+        console.print(f"[yellow]{tool} is not installed on this host.[/yellow]")
+        if tool == "systemctl":
+            console.print(
+                "Alpine and other OpenRC hosts have no systemd. Let the host's own "
+                "init supervise `atom gateway --foreground` -- see the OpenRC service "
+                "in docs/deployment.md ('Hosts Without systemd'). `atom gateway "
+                "--background` starts it now but does not survive a reboot."
+            )
+
     def print_service_result(result: GatewayServiceResult) -> None:
         console.print(f"Manager: {result.manager}")
         if result.path is not None:
@@ -284,6 +298,7 @@ def create_gateway_app(
             print_service_result(result)
             return
         console.print(f"[red]Gateway service was not installed: {result.message}[/red]")
+        print_service_hint(result)
         print_service_result(result)
         raise typer.Exit(1)
 
@@ -307,6 +322,7 @@ def create_gateway_app(
             print_service_result(result)
             return
         console.print(f"[red]Gateway service was not uninstalled: {result.message}[/red]")
+        print_service_hint(result)
         print_service_result(result)
         raise typer.Exit(1)
 
