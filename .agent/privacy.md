@@ -1,10 +1,16 @@
-# Privacy: Secret Store
+# Privacy: Secrets and Email Tokenization
 
 Design record for `atom/privacy/`. Records the decisions behind the shipped
 behaviour and the ones deliberately deferred, so neither gets re-litigated or
 silently reversed.
 
-## What is implemented
+Two independent features live here:
+
+- **Secret store** — operator-declared values the agent uses without seeing.
+- **Email tokenization** — personal data replaced with placeholders on the way
+  in and resolved on the way out.
+
+## What is implemented: secret store
 
 Operator-declared secrets, referenced by name and never shown to the model:
 
@@ -37,7 +43,12 @@ logic simple was the explicit call. Revisit only if the threat model changes.
 ```
 ~/.atom/private/          # 0700
   secrets.env             # 0600, operator-authored, plaintext values
+  tokens.json             # 0600, runtime-written, token → {type, value}
 ```
+
+Both hold plaintext, so both are 0600. `tokens.json` is the *only* place a
+tokenized address exists in plaintext — history, provider requests and tool
+arguments carry the placeholder.
 
 `~/.atom`, never the workspace: the workspace is exactly the tree the agent can
 read via `read_file` and `cat`, so plaintext there would defeat the purpose. It
@@ -168,15 +179,101 @@ Telegram's servers, and a deletion does not reach anyone who already saw it.
 - **Values are readable by anything running as the user.** 0600 is filesystem
   permissions, not encryption.
 
-## Deferred: tokenization
+## What is implemented: email tokenization
 
-Reversible substitution of PII (`alex@example.com` → a stable placeholder) was
-designed alongside this and is **not** built. It is a materially different
-feature: unbounded discovered values rather than operator-declared ones, a
-persisted map, and a per-tool detokenization allowlist that is where the whole
-risk sits. If it is picked up, note that it is *pseudonymization*, not
-anonymization — the map re-identifies every entity, so the data stays in scope
-under GDPR. Do not name a config key, command, or docstring `anonymize`.
+On by default (`privacy.tokenizeEmails`). An address becomes
+`«email:a91f2c8d»` on the way into the session and is resolved on the way out to
+the user:
+
+```
+ingress:  alex@example.com  →  «email:a91f2c8d»   (history + provider)
+egress:   «email:a91f2c8d»  →  alex@example.com   (Telegram, CLI)
+tools:    «email:a91f2c8d»  →  «email:a91f2c8d»   (unchanged)
+```
+
+The rule is **who reads it**, not where it goes. The user owns the data and sent
+it, so showing it back is not a disclosure. A placeholder passed to `web_fetch`
+or `write_file` stays a placeholder, which is what keeps this from becoming an
+exfiltration path — and is why no per-tool detokenization allowlist is needed.
+That allowlist was the riskiest part of the original design; scoping egress to
+"text going to the user" removed the need for it entirely.
+
+This is *pseudonymization*, not anonymization: the map re-identifies every
+entity, so the data stays in scope under GDPR. Do not name a config key,
+command, or docstring `anonymize`.
+
+### Why ingress rather than egress-to-provider
+
+There is no single pre-provider boundary: `chat`/`chat_stream` exist separately
+on `anthropic_provider`, `openai_compat_provider`, `fallback_provider` and
+`base`, plus `transcription` and `image_generation`. Tokenizing there means
+getting every one right, and the plaintext would still be in `history.jsonl`.
+Tokenizing on ingress covers history and every provider in one place.
+
+Slash commands are skipped: their arguments go to a command handler rather than
+a model, and `/secrets set` must reach the store byte-for-byte.
+
+### Files are deliberately untouched
+
+A file already sits in the workspace, so replacing addresses in its extracted
+text would hide them from the model while `read_file` still returns the
+original — protection that isn't. Adding it later means calling `tokenize()` at
+`extract_text` *and* `read_file`; the map is shared, so an address already seen
+in a message keeps its token with no migration.
+
+### Tokens are random, not derived
+
+HMAC would let a token be recomputed from a value without the file, which buys
+nothing here — the map is the lookup either way — while adding a key to store,
+protect and rotate. A rotation would also silently orphan every token in every
+saved session. Stability across restarts comes from the persisted map, which is
+all that was ever required.
+
+`tokens.json` is keyed by token because detokenization is the direction
+correctness depends on: a wrong lookup shows one person's data in place of
+another's. The value→token index is built in memory and never persisted.
+
+A corrupt map disables minting for the process rather than being overwritten: the
+file may be recoverable by hand, and rewriting it would strand every token
+already in saved history as an unresolvable placeholder.
+
+### The model must be told
+
+`provide_token_runtime_context` explains placeholders every turn. Without it the
+model asks the user for an address they just supplied, "corrects" a placeholder
+to an invented one, or tells the user about the placeholder instead of using it.
+Registered only when tokenization is on.
+
+### Streaming is the normal path, and it broke first
+
+A model emits a placeholder as several deltas (`«`, `email`, `:`, …), so
+resolving each delta in isolation finds nothing and the user sees a raw
+placeholder. `PlaceholderStreamResolver` holds back a tail that could be the
+start of a placeholder and releases it when the placeholder completes, or at
+stream end. `MAX_HELD_CHARS` bounds the hold so a stray `«` in prose cannot
+stall a stream.
+
+Found by running the real agent. The unit tests passed throughout — they fed
+whole placeholders, which is the one case streaming never produces.
+
+### Three boundaries, not one
+
+`MessageBus.publish_outbound` covers everything reaching a channel through the
+bus. `process_direct` (used by `atom agent -m`, the API server, subagents)
+returns its result to the caller and drives its own callbacks, so it needs the
+same treatment in three places:
+
+| Path | Resolved by |
+| --- | --- |
+| bus (`OutboundMessage`, stream deltas, progress events) | `MessageBus.filter_outbound` |
+| direct return value | `_resolve_outbound_placeholders` |
+| direct stream callbacks | `_resolve_direct_stream_callbacks` |
+| direct progress callback | `_resolve_direct_progress_callback` |
+
+All four route through the bus's own filter, so there is one definition of what
+gets resolved. The progress case was found live: a tool-hint line showed
+`echo 'contact is «email:ed07eada»'` while the reply beside it showed the
+address.
 
 ## Modules
 
@@ -185,9 +282,17 @@ under GDPR. Do not name a config key, command, or docstring `anonymize`.
 | `store.py` | `secrets.env` — validation, parsing, atomic writes |
 | `commands.py` | `/secrets` reply text and the delete-source request |
 | `env.py` | injection into `ExecTool._build_env` |
+| `tokens.py` | `tokens.json` — minting, both-direction lookup, `tokenize`/`detokenize` |
+| `hooks.py` | ingress boundary and the model-facing guidance block |
+| `stream.py` | placeholder resolution across stream-delta boundaries |
 
-Testing note: `conftest.py` redirects `DEFAULT_SECRET_STORE` for every test in
-the suite. `_build_env` reads the store, so without it any test that builds a
-subprocess environment would read — and a mistakenly un-injected write would
-modify — the developer's real `secrets.env`. An early version of the command
-tests did exactly that.
+Testing note: `conftest.py` redirects both `DEFAULT_SECRET_STORE` and
+`DEFAULT_TOKEN_STORE` for every test in the suite. `_build_env` reads the secret
+store and `tokenize_emails` defaults on, so without these a test would read — and
+a mistakenly un-injected write would modify — the developer's real
+`~/.atom/private/` files. An early version of the command tests did exactly that.
+
+Unit tests are not sufficient for this feature. Three of its bugs only appear
+against a live model: the direct-mode return value, split stream deltas, and the
+progress line. Run `atom agent -m` against a real provider before trusting a
+change here.

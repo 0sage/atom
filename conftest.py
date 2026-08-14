@@ -35,3 +35,21 @@ def _isolate_secret_store(tmp_path_factory, monkeypatch) -> Iterator[None]:
         store_module, "DEFAULT_SECRET_STORE", store_module.SecretStore(path=isolated)
     )
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_token_store(tmp_path_factory, monkeypatch) -> Iterator[None]:
+    """Point the default token map at a throwaway file for every test.
+
+    ``tokenize_emails`` defaults on, so any test that drives a user turn would
+    otherwise mint entries into the developer's real
+    ``~/.atom/private/tokens.json`` — accumulating addresses harvested from test
+    fixtures into a file that persists.
+    """
+    from atom.privacy import tokens as tokens_module
+
+    isolated = tmp_path_factory.mktemp("token-store") / "tokens.json"
+    monkeypatch.setattr(
+        tokens_module, "DEFAULT_TOKEN_STORE", tokens_module.TokenStore(path=isolated)
+    )
+    yield

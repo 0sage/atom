@@ -376,6 +376,22 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class PrivacyConfig(Base):
+    """Pseudonymization of personal data in message text.
+
+    Only message text is processed. Files are deliberately untouched: a file
+    already sits in the workspace, so replacing addresses in its extracted text
+    would hide them from the model while ``read_file`` still returns the
+    original.
+    """
+
+    #: Replace email addresses with «email:...» placeholders before they reach
+    #: session history or a provider, and resolve them again on the way out to
+    #: the user. Tool arguments are never resolved, so an address the agent
+    #: writes to a file or passes to a command stays a placeholder.
+    tokenize_emails: bool = True
+
+
 class Config(BaseSettings):
     """Root configuration for atom."""
 
@@ -386,6 +402,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),

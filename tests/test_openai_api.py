@@ -503,11 +503,14 @@ async def test_empty_response_falls_back_without_retry(aiohttp_client) -> None:
 async def test_process_direct_accepts_media() -> None:
     """process_direct should forward media paths to _process_message."""
     from atom.agent.loop import AgentLoop
+    from atom.bus.queue import MessageBus
     from atom.bus.runtime_events import RuntimeEventPublisher
 
     loop = AgentLoop.__new__(AgentLoop)
     loop._session_locks = {}
     loop.runtime_event_publisher = RuntimeEventPublisher()
+    # process_direct resolves privacy placeholders through the bus filter.
+    loop.bus = MessageBus()
 
     captured_msg = None
 

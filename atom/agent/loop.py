@@ -103,6 +103,19 @@ _T = TypeVar("_T")
 _SUBAGENT_PROVIDER_TASK_META = "subagent_provider_task_id"
 
 
+def _flush_stream_filter(transform: object, stream_key: str) -> str:
+    """Release any text an outbound text filter is holding for *stream_key*.
+
+    The filter is only required to be callable, so the flush capability is
+    optional and probed rather than assumed.
+    """
+    flush = getattr(transform, "flush", None)
+    if not callable(flush):
+        return ""
+    result = flush(stream_key)
+    return result if isinstance(result, str) else ""
+
+
 class TurnKind(Enum):
     USER = auto()
     SYSTEM = auto()
@@ -289,12 +302,21 @@ class AgentLoop:
         restart_mode: str = "auto",
         local_trigger_store: LocalTriggerStore | None = None,
         idle_compact_check_interval_seconds: int = 0,
+        tokenize_emails: bool = False,
     ):
         from atom.config.schema import ToolsConfig
 
+        self.tokenize_emails = tokenize_emails
         _tc = tools_config or ToolsConfig()
         defaults = AgentDefaults()
         self.bus = bus
+        if tokenize_emails:
+            # One hook on the transport covers every consumer — channel manager,
+            # CLI, SDK — so a new channel cannot forget to resolve placeholders.
+            # Stateful because a placeholder arrives split across stream deltas.
+            from atom.privacy.stream import PlaceholderStreamResolver
+
+            bus.outbound_text_filter = PlaceholderStreamResolver()
         if turn_delivery_factory is not None:
             if turn_delivery_factory.bus is not bus:
                 raise ValueError("turn delivery factory must use the agent message bus")
@@ -392,6 +414,12 @@ class AgentLoop:
         self._unified_session = unified_session
         self._running = False
         self._runtime_context_providers: list[RuntimeContextProvider] = []
+        if tokenize_emails:
+            # Without this the model has no way to know a placeholder stands for
+            # a real value, and will ask the user for data they already sent.
+            from atom.privacy.hooks import provide_token_runtime_context
+
+            self._runtime_context_providers.append(provide_token_runtime_context)
         self._active_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._discarding_sessions: set[str] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
@@ -493,6 +521,7 @@ class AgentLoop:
             provider_retry_mode=defaults.provider_retry_mode,
             tool_hint_max_length=defaults.tool_hint_max_length,
             restrict_to_workspace=config.tools.restrict_to_workspace,
+            tokenize_emails=config.privacy.tokenize_emails,
             channels_config=config.channels,
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
@@ -1392,6 +1421,17 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         kind = TurnKind.SYSTEM if msg.channel == "system" else TurnKind.USER
+        if kind is TurnKind.USER:
+            # Tokenize before anything reads msg.content, so history, the
+            # provider request and every tool argument carry the placeholder
+            # rather than the address.
+            from atom.privacy.hooks import tokenize_user_text
+
+            tokenized = tokenize_user_text(
+                msg.content, enabled=self.tokenize_emails,
+            )
+            if tokenized != msg.content:
+                msg = dataclasses.replace(msg, content=tokenized)
         if kind is TurnKind.SYSTEM:
             destination = (
                 msg.chat_id.split(":", 1) if ":" in msg.chat_id else ("cli", msg.chat_id)
@@ -1477,12 +1517,12 @@ class AgentLoop:
         await self._run_turn_stage(ctx, "restore", self._restore_turn)
         await self._run_turn_stage(ctx, "compact", self._compact_session)
         if await self._run_turn_stage(ctx, "command", self._dispatch_command):
-            return ctx.outbound
+            return self._resolve_outbound_placeholders(ctx.outbound)
         await self._run_turn_stage(ctx, "build", self._build_turn)
         await self._run_turn_stage(ctx, "run", self._run_turn)
         await self._run_turn_stage(ctx, "save", self._persist_turn)
         await self._run_turn_stage(ctx, "respond", self._prepare_outbound)
-        return ctx.outbound
+        return self._resolve_outbound_placeholders(ctx.outbound)
 
     async def _run_turn_stage(
         self,
@@ -2235,11 +2275,17 @@ class AgentLoop:
         lock = self._get_session_lock(session_key)
         try:
             async with lock:
+                # Direct callers get raw model deltas, which carry placeholders;
+                # the bus path resolves them in publish_outbound, so this path
+                # needs the same treatment.
+                direct_stream, direct_stream_end = self._resolve_direct_stream_callbacks(
+                    f"direct:{session_key}", on_stream, on_stream_end,
+                )
                 kwargs: dict[str, Any] = {
                     "session_key": session_key,
-                    "on_progress": on_progress,
-                    "on_stream": on_stream,
-                    "on_stream_end": on_stream_end,
+                    "on_progress": self._resolve_direct_progress_callback(on_progress),
+                    "on_stream": direct_stream,
+                    "on_stream_end": direct_stream_end,
                     "ephemeral": ephemeral,
                 }
                 if _run_extra_hooks_for_ephemeral:
@@ -2263,6 +2309,87 @@ class AgentLoop:
         finally:
             await self.runtime_event_publisher.run_status_changed(msg, session_key, "idle")
             self.runtime_event_publisher.clear_turn(session_key)
+
+    def _resolve_outbound_placeholders(
+        self, outbound: OutboundMessage | None,
+    ) -> OutboundMessage | None:
+        """Resolve privacy placeholders in a directly-returned turn result.
+
+        ``MessageBus.publish_outbound`` covers everything that reaches a channel
+        through the bus, but ``process_direct`` returns its result to the caller
+        instead, so that path needs the same filter. Both go through the bus's
+        own transform so there is one definition of what gets resolved.
+        """
+        if outbound is None:
+            return None
+        return self.bus.filter_outbound(outbound)
+
+    def _resolve_direct_stream_callbacks(
+        self,
+        stream_key: str,
+        on_stream: Callable[[str], Awaitable[None]] | None,
+        on_stream_end: Callable[..., Awaitable[None]] | None,
+    ) -> tuple[
+        Callable[[str], Awaitable[None]] | None,
+        Callable[..., Awaitable[None]] | None,
+    ]:
+        """Wrap direct-mode stream callbacks so deltas show resolved values.
+
+        Deltas are raw model output and carry placeholders. The bus path resolves
+        them in ``publish_outbound``; a direct caller's callbacks bypass that.
+
+        The filter holds back a partial placeholder, so ``on_stream_end`` must
+        release whatever is still held or the tail of a message would be lost.
+        """
+        transform = self.bus.outbound_text_filter
+        if transform is None or (on_stream is None and on_stream_end is None):
+            return on_stream, on_stream_end
+
+        wrapped_stream = on_stream
+        if on_stream is not None:
+            inner_stream = on_stream
+
+            async def _resolved(delta: str) -> None:
+                await inner_stream(
+                    transform(delta, stream_id=stream_key) if delta else delta
+                )
+
+            wrapped_stream = _resolved
+
+        inner_end = on_stream_end
+
+        async def _resolved_end(**kwargs: Any) -> None:
+            tail = _flush_stream_filter(transform, stream_key)
+            if tail and on_stream is not None:
+                await on_stream(tail)
+            if inner_end is not None:
+                await inner_end(**kwargs)
+
+        return wrapped_stream, _resolved_end
+
+    def _resolve_direct_progress_callback(
+        self,
+        on_progress: Callable[..., Awaitable[None]] | None,
+    ) -> Callable[..., Awaitable[None]] | None:
+        """Resolve placeholders in direct-mode progress lines.
+
+        In the bus path a progress line is a ``ProgressEvent`` and is filtered by
+        ``publish_outbound``. A direct caller's callback bypasses that, which
+        left tool-hint lines showing a raw placeholder while the reply beside
+        them showed the value.
+
+        Progress lines are self-contained rather than streamed, so each is
+        resolved as final and nothing is held back.
+        """
+        transform = self.bus.outbound_text_filter
+        if on_progress is None or transform is None:
+            return on_progress
+        inner = on_progress
+
+        async def _resolved(content: str = "", **kwargs: Any) -> None:
+            await inner(transform(content, final=True) if content else content, **kwargs)
+
+        return _resolved
 
     def _get_session_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared lock while allowing idle session entries to expire."""

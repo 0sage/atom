@@ -137,15 +137,19 @@ def _split_assignment(line: str) -> tuple[str, str] | None:
 
 
 def _write_secret_file(path: Path, lines: list[str]) -> None:
-    """Write *lines* to *path* atomically, never widening the mode.
-
-    ``utils.helpers._write_text_atomic`` cannot be reused here: it opens the
-    temp file at the process umask and only chmods afterwards, which would leave
-    the secret briefly world-readable. This opens with 0600 from the start.
-    """
+    """Write *lines* to ``secrets.env`` atomically, ending with one newline."""
     content = "\n".join(lines).rstrip("\n")
-    if content:
-        content += "\n"
+    write_private_text(path, content + "\n" if content else "")
+
+
+def write_private_text(path: Path, content: str) -> None:
+    """Write *content* to *path* atomically at mode 0600.
+
+    ``utils.helpers._write_text_atomic`` cannot be reused for files under
+    ``private/``: it opens the temp file at the process umask and only chmods
+    afterwards, which would leave the contents briefly world-readable. This
+    opens with 0600 from the start.
+    """
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

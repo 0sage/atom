@@ -125,6 +125,17 @@ def _event_content(event: OutboundEvent) -> str:
     return ""
 
 
+def replace_event_content(event: OutboundEvent, content: str) -> OutboundEvent:
+    """Return *event* carrying *content*, or *event* unchanged if it holds none.
+
+    Which events carry user-visible text is knowledge that belongs here with the
+    event definitions, not in a transport or a consumer.
+    """
+    if isinstance(event, ProgressEvent | RetryWaitEvent | StreamDeltaEvent | StreamEndEvent):
+        return replace(event, content=content)
+    return event
+
+
 def _legacy_event_from_metadata(msg: OutboundMessage) -> OutboundEvent | None:
     """Bridge pre-typed outbound metadata flags into typed events.
 
