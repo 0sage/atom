@@ -55,8 +55,14 @@ Messages flow through an async `MessageBus` (`atom/bus/queue.py`) that decouples
 ## Project-Specific Notes
 
 - Architecture constraints: [`.agent/design.md`](.agent/design.md)
-- Security boundaries: [`.agent/security.md`](.agent/security.md)
 - Common gotchas: [`.agent/gotchas.md`](.agent/gotchas.md)
+
+The security boundaries are imported rather than linked, so they are always in
+context. A link loads only if the agent chooses to follow it, and these describe
+guards that must not be bypassed — the one file where "usually read" is not good
+enough. The other two stay links to keep this file cheap to load every turn.
+
+@.agent/security.md
 
 ## Code Style
 
