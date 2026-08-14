@@ -16,7 +16,8 @@ def store(tmp_path) -> SecretStore:
 
 
 def run(args: str, store: SecretStore) -> str:
-    return handle_secrets_command(args, store=store)
+    """Reply text only — most assertions here are about what the user is told."""
+    return handle_secrets_command(args, store=store).text
 
 
 class TestList:
@@ -108,8 +109,61 @@ class TestSet:
         assert "Stored TOKEN" in run("set TOKEN=1111", store)
         assert store.get("TOKEN") == "1111"
 
-    def test_advises_deleting_the_message(self, store: SecretStore) -> None:
-        assert "Delete the message" in run(f"set TOKEN={SECRET}", store)
+    def test_confirms_the_value_was_redacted(self, store: SecretStore) -> None:
+        assert "redacted" in run(f"set TOKEN={SECRET}", store)
+
+
+class TestDeletionRequest:
+    """``carried_value`` asks the channel to delete the user's message.
+
+    It must be set whenever a value was *typed*, not only when it was stored:
+    a rejected name and a mistyped verb both leave a real secret in the chat.
+    """
+
+    def reply(self, args: str, store: SecretStore):
+        return handle_secrets_command(args, store=store)
+
+    def test_set_requests_deletion(self, store: SecretStore) -> None:
+        assert self.reply(f"set TOKEN={SECRET}", store).carried_value is True
+
+    def test_space_separated_set_requests_deletion(self, store: SecretStore) -> None:
+        assert self.reply(f"set TOKEN {SECRET}", store).carried_value is True
+
+    def test_rejected_name_still_requests_deletion(self, store: SecretStore) -> None:
+        """The name failed validation, but the value was typed next to it."""
+        reply = self.reply(f"set BAD-NAME={SECRET}", store)
+        assert reply.carried_value is True
+        assert store.load() == {}
+
+    def test_reserved_name_still_requests_deletion(self, store: SecretStore) -> None:
+        assert self.reply("set PATH=/evil/bin", store).carried_value is True
+
+    def test_mistyped_verb_with_assignment_requests_deletion(
+        self, store: SecretStore,
+    ) -> None:
+        assert self.reply(f"sett TOKEN={SECRET}", store).carried_value is True
+
+    def test_write_failure_still_requests_deletion(
+        self, store: SecretStore, monkeypatch,
+    ) -> None:
+        def boom(*_args: object, **_kwargs: object) -> str:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(store, "set", boom)
+        reply = self.reply(f"set TOKEN={SECRET}", store)
+        assert reply.carried_value is True
+        assert SECRET not in reply.text
+
+    @pytest.mark.parametrize(
+        "args",
+        ["", "list", "del TOKEN", "help", "get TOKEN", "set", "set TOKEN"],
+    )
+    def test_no_deletion_when_no_value_typed(
+        self, store: SecretStore, args: str,
+    ) -> None:
+        """Deleting a message that held no secret would destroy the user's own
+        text for nothing."""
+        assert self.reply(args, store).carried_value is False
 
 
 class TestDelete:

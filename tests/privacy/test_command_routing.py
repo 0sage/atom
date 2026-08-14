@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from atom.bus.events import OUTBOUND_META_DELETE_SOURCE
 from atom.command.builtin import register_builtin_commands
 from atom.command.router import CommandContext, CommandRouter
 
@@ -34,8 +35,10 @@ def secrets_store(tmp_path, monkeypatch):
     return replacement
 
 
-def make_ctx(raw: str) -> CommandContext:
-    msg = MagicMock(channel="telegram", chat_id="chat1", metadata={})
+def make_ctx(raw: str, message_id: int = 4242) -> CommandContext:
+    msg = MagicMock(
+        channel="telegram", chat_id="chat1", metadata={"message_id": message_id},
+    )
     return CommandContext(
         msg=msg, session=None, key="telegram:chat1", raw=raw, loop=MagicMock(),
     )
@@ -144,6 +147,51 @@ class TestPriorityDispatch:
         assert result is not None
         assert result.channel == "telegram"
         assert result.chat_id == "chat1"
+
+
+class TestSourceDeletionRequest:
+    """The reply carries the flag that asks the channel to delete the input."""
+
+    @pytest.mark.asyncio
+    async def test_set_asks_the_channel_to_delete(
+        self, router: CommandRouter, secrets_store,
+    ) -> None:
+        result = await router.dispatch_priority(
+            make_ctx(f"/secrets set TOKEN={SECRET}")
+        )
+        assert result is not None
+        assert result.metadata[OUTBOUND_META_DELETE_SOURCE] is True
+        # The channel needs the id of the message to remove.
+        assert result.metadata["message_id"] == 4242
+
+    @pytest.mark.asyncio
+    async def test_list_does_not_ask_for_deletion(
+        self, router: CommandRouter, secrets_store,
+    ) -> None:
+        result = await router.dispatch_priority(make_ctx("/secrets"))
+        assert result is not None
+        assert OUTBOUND_META_DELETE_SOURCE not in result.metadata
+
+    @pytest.mark.asyncio
+    async def test_delete_subcommand_does_not_ask_for_deletion(
+        self, router: CommandRouter, secrets_store,
+    ) -> None:
+        """`/secrets del TOKEN` names a secret but contains no value."""
+        secrets_store.set("TOKEN", SECRET)
+        result = await router.dispatch_priority(make_ctx("/secrets del TOKEN"))
+        assert result is not None
+        assert OUTBOUND_META_DELETE_SOURCE not in result.metadata
+
+    @pytest.mark.asyncio
+    async def test_rejected_value_still_asks_for_deletion(
+        self, router: CommandRouter, secrets_store,
+    ) -> None:
+        result = await router.dispatch_priority(
+            make_ctx(f"/secrets set BAD-NAME={SECRET}")
+        )
+        assert result is not None
+        assert result.metadata[OUTBOUND_META_DELETE_SOURCE] is True
+        assert SECRET not in result.content
 
 
 class TestExistingPriorityCommandsUnaffected:

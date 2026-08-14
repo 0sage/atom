@@ -12,7 +12,7 @@ try:
 except ImportError:
     pytest.skip("Telegram dependencies not installed (python-telegram-bot)", allow_module_level=True)
 
-from atom.bus.events import OutboundMessage
+from atom.bus.events import OUTBOUND_META_DELETE_SOURCE, OutboundMessage
 from atom.bus.outbound_events import ProgressEvent
 from atom.bus.queue import MessageBus
 from atom.channels.telegram.runtime import (
@@ -2415,3 +2415,124 @@ def test_markdown_to_html_code_block_same_line_no_newline() -> None:
 
     stripped = _strip_md_block(text)
     assert stripped == "Use <tag> here"
+
+
+@pytest.mark.asyncio
+async def test_delete_source_message_flag_deletes_the_user_message() -> None:
+    """A /secrets reply asks Telegram to delete the message holding the value."""
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.delete_message = AsyncMock()
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="Stored TOKEN (21 chars). Value redacted from this chat.",
+            metadata={"message_id": 4242, OUTBOUND_META_DELETE_SOURCE: True},
+        )
+    )
+
+    channel._app.bot.delete_message.assert_awaited_once_with(chat_id=123, message_id=4242)
+    # The confirmation still goes out.
+    assert len(channel._app.bot.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_deletion_without_the_flag() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.delete_message = AsyncMock()
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram", chat_id="123", content="hello",
+            metadata={"message_id": 4242},
+        )
+    )
+
+    channel._app.bot.delete_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_failure_still_sends_the_confirmation() -> None:
+    """Telegram refuses deletes past 48h and without can_delete_messages.
+
+    The confirmation must still arrive, or the user cannot tell whether the
+    secret was stored.
+    """
+    from telegram.error import BadRequest
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.delete_message = AsyncMock(
+        side_effect=BadRequest("message can't be deleted")
+    )
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram", chat_id="123", content="Stored TOKEN.",
+            metadata={"message_id": 4242, OUTBOUND_META_DELETE_SOURCE: True},
+        )
+    )
+
+    assert len(channel._app.bot.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_flag_without_message_id_is_a_noop() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.delete_message = AsyncMock()
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram", chat_id="123", content="Stored TOKEN.",
+            metadata={OUTBOUND_META_DELETE_SOURCE: True},
+        )
+    )
+
+    channel._app.bot.delete_message.assert_not_awaited()
+    assert len(channel._app.bot.sent_messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_source_still_sends_when_replying_to_it() -> None:
+    """With reply_to_message on, the reply targets the message just deleted.
+
+    ``allow_sending_without_reply`` is what keeps the confirmation from being
+    rejected once the target is gone.
+    """
+    channel = TelegramChannel(
+        TelegramConfig(
+            enabled=True, token="123:abc", allow_from=["*"], reply_to_message=True,
+        ),
+        MessageBus(),
+    )
+    channel._app = _FakeApp(lambda: None)
+    channel._app.bot.delete_message = AsyncMock()
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram", chat_id="123", content="Stored TOKEN.",
+            metadata={"message_id": 4242, OUTBOUND_META_DELETE_SOURCE: True},
+        )
+    )
+
+    channel._app.bot.delete_message.assert_awaited_once()
+    assert len(channel._app.bot.sent_messages) == 1
+    reply_params = channel._app.bot.sent_messages[0].get("reply_parameters")
+    assert reply_params is not None
+    assert reply_params.allow_sending_without_reply is True

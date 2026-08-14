@@ -127,13 +127,38 @@ Works on every channel: `AgentLoop` owns the single router, and the CLI
 publishes to the same bus, so Telegram, the CLI TUI, and the WebUI all get it.
 The CLI is the safer path — the value never leaves the machine.
 
+## Deleting the user's message
+
+`handle_secrets_command` returns `SecretsReply(text, carried_value)`.
+`carried_value` sets `OUTBOUND_META_DELETE_SOURCE` on the reply, which asks the
+channel to delete the message identified by `metadata["message_id"]`. Telegram
+honors it in `_delete_source_message`; channels that cannot delete ignore the
+flag.
+
+`carried_value` is set whenever a value was **typed**, not only when it was
+stored. A rejected name (`set BAD-NAME=ghp_real`), a write failure, and a
+mistyped verb (`sett TOKEN=ghp_real`) all leave a real secret in the chat, so
+each one still requests deletion. Conversely `list`, `del NAME`, `help` and the
+usage errors carry no value, and deleting those would destroy the user's own
+text for nothing.
+
+Best-effort by construction, and the reply must never claim otherwise: Telegram
+refuses to delete messages older than 48 hours, and a bot without
+`can_delete_messages` cannot delete in a group at all. The confirmation is sent
+regardless of whether the delete succeeded — otherwise the user cannot tell
+whether the secret was stored. The reply says "Value redacted from this chat"
+rather than "message deleted" for the same reason.
+
+This narrows the gap below; it does not close it. The plaintext still reached
+Telegram's servers, and a deletion does not reach anyone who already saw it.
+
 ## Known gaps
 
 - **The chat channel sees the value.** Typing `/secrets set` in Telegram puts
   the plaintext in the sender's message history and on Telegram's servers before
-  atom ever sees it. Priority dispatch protects atom's disk; it cannot unsend
-  that. The reply advises deleting the message. This risk was explicitly
-  accepted; the CLI avoids it.
+  atom ever sees it. Priority dispatch protects atom's disk; the automatic
+  deletion above removes the message afterwards, but neither unsends what
+  already arrived. This risk was explicitly accepted; the CLI avoids it.
 - **No authorization.** The router does not restrict who may run a command, so
   in a group chat any member can set a secret that the shell tool then inherits.
   Gating on the pairing store, or restricting to DMs, is unbuilt.
@@ -158,7 +183,7 @@ under GDPR. Do not name a config key, command, or docstring `anonymize`.
 | File | Owns |
 | --- | --- |
 | `store.py` | `secrets.env` — validation, parsing, atomic writes |
-| `commands.py` | `/secrets` reply text |
+| `commands.py` | `/secrets` reply text and the delete-source request |
 | `env.py` | injection into `ExecTool._build_env` |
 
 Testing note: `conftest.py` redirects `DEFAULT_SECRET_STORE` for every test in

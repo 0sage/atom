@@ -12,6 +12,13 @@ if TYPE_CHECKING:
 # render it and other channels may ignore unknown keys.
 OUTBOUND_META_AGENT_UI = "_agent_ui"
 
+# Optional ``OutboundMessage.metadata`` key asking the channel to delete the
+# user message this reply answers, identified by ``metadata["message_id"]``.
+# Set only when the user's own text is the thing that must not persist — a
+# secret value typed into a chat. Channels that cannot delete ignore it, so the
+# request is best-effort by construction and callers must not report success.
+OUTBOUND_META_DELETE_SOURCE = "_delete_source_message"
+
 # Internal-only inbound metadata used by in-process channels to ask the agent
 # loop to update runtime state without going through a user session.
 INBOUND_META_RUNTIME_CONTROL = "_runtime_control"

@@ -8,6 +8,8 @@ would undo the point of the command.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from atom.privacy import store as store_module
 from atom.privacy.store import SecretError, SecretStore
 
@@ -20,13 +22,30 @@ USAGE = (
     "never sent to the model; the agent uses them as $NAME in shell commands."
 )
 
+
+@dataclass(frozen=True)
+class SecretsReply:
+    """Reply text plus whether the command carried a secret value.
+
+    ``carried_value`` asks the channel to delete the user's message. It is set
+    whenever the input *contained* a value — including when the command was
+    rejected — because a name that failed validation was still typed alongside
+    a real secret, and a mistyped verb carries one too.
+    """
+
+    text: str
+    carried_value: bool = False
+
+
 def _describe(name: str, value: str) -> str:
     """Render one inventory line: enough to identify, not enough to use."""
     return f"- {name} ({len(value)} chars)"
 
 
-def handle_secrets_command(args: str, store: SecretStore | None = None) -> str:
-    """Handle ``/secrets`` and return the reply text.
+def handle_secrets_command(
+    args: str, store: SecretStore | None = None,
+) -> SecretsReply:
+    """Handle ``/secrets`` and return the reply.
 
     *args* is passed verbatim from the router, without case folding, because a
     value's case is significant.
@@ -39,7 +58,7 @@ def handle_secrets_command(args: str, store: SecretStore | None = None) -> str:
     text = args.strip()
 
     if not text or text.lower() == "list":
-        return _list(store)
+        return SecretsReply(_list(store))
 
     verb, _, rest = text.partition(" ")
     verb = verb.lower()
@@ -48,16 +67,29 @@ def handle_secrets_command(args: str, store: SecretStore | None = None) -> str:
     if verb == "set":
         return _set(store, rest)
     if verb in {"del", "delete", "rm", "remove", "unset"}:
-        return _delete(store, rest)
+        return SecretsReply(_delete(store, rest))
     if verb in {"help", "-h", "--help"}:
-        return USAGE
+        return SecretsReply(USAGE)
     if verb == "get":
-        return (
+        return SecretsReply(
             "Secret values are never shown. Use /secrets to list names, or "
             "reference the secret as $NAME in a shell command."
         )
-    # Do not echo the unrecognized verb: a mistyped "set" would print the value.
-    return f"Unknown /secrets subcommand.\n\n{USAGE}"
+    # Do not echo the unrecognized verb: a mistyped "set" would print the value,
+    # and for the same reason the message is treated as carrying one.
+    return SecretsReply(
+        f"Unknown /secrets subcommand.\n\n{USAGE}",
+        carried_value=_looks_like_an_assignment(rest),
+    )
+
+
+def _looks_like_an_assignment(rest: str) -> bool:
+    """Whether the remainder of a mistyped command still carried a value.
+
+    ``/secrest TOKEN=ghp_real`` was rejected, but the value was typed, so the
+    message still needs deleting.
+    """
+    return "=" in rest or bool(rest.strip() and " " in rest.strip())
 
 
 def _list(store: SecretStore) -> str:
@@ -74,26 +106,30 @@ def _list(store: SecretStore) -> str:
     return "\n".join(lines)
 
 
-def _set(store: SecretStore, rest: str) -> str:
+def _set(store: SecretStore, rest: str) -> SecretsReply:
     if not rest:
-        return f"Usage: /secrets set NAME=value\n\n{USAGE}"
+        return SecretsReply(f"Usage: /secrets set NAME=value\n\n{USAGE}")
     name, sep, value = rest.partition("=")
     if not sep:
         # Accept "set NAME value" as well; the value may itself contain spaces.
         name, _, value = rest.partition(" ")
     if not value:
-        return f"Usage: /secrets set NAME=value\n\n{USAGE}"
+        return SecretsReply(f"Usage: /secrets set NAME=value\n\n{USAGE}")
 
+    # From here the input carried a value, so every exit deletes the message —
+    # a rejected name was still typed next to a real secret.
     try:
         key = store.set(name, value)
     except SecretError as exc:
-        return str(exc)
+        return SecretsReply(str(exc), carried_value=True)
     except OSError as exc:
-        return f"Could not write the secrets file: {exc}"
+        return SecretsReply(
+            f"Could not write the secrets file: {exc}", carried_value=True,
+        )
 
-    return (
-        f"Stored {key} ({len(value)} chars).\n"
-        "Delete the message above to keep the value out of this chat's history."
+    return SecretsReply(
+        f"Stored {key} ({len(value)} chars). Value redacted from this chat.",
+        carried_value=True,
     )
 
 

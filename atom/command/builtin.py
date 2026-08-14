@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from atom import __logo__, __version__
-from atom.bus.events import OutboundMessage
+from atom.bus.events import OUTBOUND_META_DELETE_SOURCE, OutboundMessage
 from atom.command.router import CommandContext, CommandRouter, normalize_command_text
 from atom.utils.helpers import build_status_content
 from atom.utils.restart import set_restart_notice_to_env
@@ -891,11 +891,17 @@ async def cmd_secrets(ctx: CommandContext) -> OutboundMessage:
     from atom.privacy.commands import handle_secrets_command
 
     reply = handle_secrets_command(ctx.args)
+    metadata: dict[str, Any] = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
+    if reply.carried_value:
+        # Ask the channel to delete the user's message: the value is in their
+        # chat history until it does. Best-effort — channels that cannot delete
+        # ignore the flag, which is why the reply never claims it succeeded.
+        metadata[OUTBOUND_META_DELETE_SOURCE] = True
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
-        content=reply,
-        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        content=reply.text,
+        metadata=metadata,
     )
 
 

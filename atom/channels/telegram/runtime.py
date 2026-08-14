@@ -29,7 +29,7 @@ from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
-from atom.bus.events import OutboundMessage
+from atom.bus.events import OUTBOUND_META_DELETE_SOURCE, OutboundMessage
 from atom.bus.outbound_events import ProgressEvent
 from atom.bus.queue import MessageBus
 from atom.channels.base import BaseChannel
@@ -763,6 +763,10 @@ class TelegramChannel(BaseChannel):
         except ValueError:
             self.logger.exception("Invalid chat_id: {}", msg.chat_id)
             return
+
+        if msg.metadata.get(OUTBOUND_META_DELETE_SOURCE):
+            await self._delete_source_message(chat_id, msg.metadata.get("message_id"))
+
         reply_to_message_id = msg.metadata.get("message_id")
         message_thread_id = msg.metadata.get("message_thread_id")
         if message_thread_id is None and reply_to_message_id is not None:
@@ -1639,6 +1643,26 @@ class TelegramChannel(BaseChannel):
             )
         except Exception as e:
             self.logger.debug("reaction failed: {}", e)
+
+    async def _delete_source_message(self, chat_id: int, message_id: Any) -> None:
+        """Delete the user message a reply answers (best-effort).
+
+        Used when the user's own text must not persist — a secret value typed
+        into a chat. Failure is expected and tolerated: Telegram refuses to
+        delete messages older than 48 hours, and a bot without the
+        ``can_delete_messages`` right in a group cannot delete at all. The
+        caller must not claim the message was removed.
+        """
+        if not self._app or message_id is None:
+            return
+        try:
+            await self._call_with_retry(
+                self._app.bot.delete_message,
+                chat_id=chat_id,
+                message_id=int(message_id),
+            )
+        except Exception as exc:
+            self.logger.debug("source message deletion failed: {}", exc)
 
     async def _remove_reaction(self, chat_id: str, message_id: int) -> None:
         """Remove emoji reaction from a message (best-effort, non-blocking)."""
