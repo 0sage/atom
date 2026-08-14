@@ -36,6 +36,9 @@ def _mk_loop() -> AgentLoop:
     from atom.config.schema import AgentDefaults
 
     loop.max_tool_result_chars = AgentDefaults().max_tool_result_chars
+    # _persist_subagent_followup tokenizes injected text; off here so these
+    # tests assert on the content they pass in.
+    loop.tokenize_emails = False
     return loop
 
 

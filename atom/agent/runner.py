@@ -111,6 +111,10 @@ class AgentRunSpec:
     llm_timeout_s: float | None = None
     finalize_on_max_iterations: bool = True
     provider_state: ProviderConversationState | None = None
+    #: Replace contact data in tool output with placeholders before it is
+    #: persisted or shown to the model. Tool results are where third-party data
+    #: arrives in bulk, so this is the larger ingress path of the two.
+    tokenize_tool_results: bool = False
 
 
 @dataclass(slots=True)
@@ -427,6 +431,7 @@ class AgentRunner:
             workspace=spec.workspace,
             session_key=spec.session_key,
             max_tool_result_chars=spec.max_tool_result_chars,
+            tokenize_tool_results=spec.tokenize_tool_results,
             context_window_tokens=spec.runtime.context_window_tokens,
             context_block_limit=spec.context_block_limit,
             max_tokens=spec.runtime.generation.max_tokens,

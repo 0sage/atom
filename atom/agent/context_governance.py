@@ -64,6 +64,11 @@ class ContextGovernanceConfig:
     workspace: Path | None
     session_key: str | None
     max_tool_result_chars: int
+    #: Replace contact data in tool output with placeholders. Tool results are
+    #: where bulk third-party data arrives, so this is the larger exposure of the
+    #: two ingress paths — but it is also the one where the agent still needs to
+    #: work with the data, hence the domain-preserving form.
+    tokenize_tool_results: bool = False
     context_window_tokens: int | None = None
     context_block_limit: int | None = None
     max_tokens: int | None = None
@@ -115,6 +120,14 @@ class ContextGovernor:
         result: Any,
     ) -> Any:
         result = ensure_nonempty_tool_result(tool_name, result)
+        if config.tokenize_tool_results:
+            # Before anything else: every tool that can carry someone else's
+            # contact data funnels through here — exec, web_fetch, and every MCP
+            # wrapper — and both the offload path below and the model copy read
+            # from this value, so tokenizing later would miss one of them.
+            from atom.privacy.hooks import tokenize_tool_result
+
+            result = tokenize_tool_result(result)
         if tool_name in TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS:
             return result
         try:

@@ -410,6 +410,7 @@ class AgentLoop:
             max_iterations=self.max_iterations,
             max_concurrent_subagents=max_concurrent_subagents,
             fail_on_tool_error=fail_on_tool_error,
+            tokenize_tool_results=tokenize_emails,
         )
         self._unified_session = unified_session
         self._running = False
@@ -1099,6 +1100,7 @@ class AgentLoop:
                 checkpoint_callback=_checkpoint,
                 injection_callback=_drain_pending,
                 provider_state=provider_state,
+                tokenize_tool_results=self.tokenize_emails,
             ))
         finally:
             turn_scope_stack.close()
@@ -2085,9 +2087,17 @@ class AgentLoop:
             for m in session.messages
         ):
             return False
+        # A subagent arrives on the "system" channel, so the user-text hook in
+        # _process_message skips it. Its own tool results and prompt are already
+        # tokenized, so its text should only ever carry placeholders — this is the
+        # backstop for that reasoning being wrong, and is a no-op when it holds
+        # (tokenize only matches addresses, and a placeholder is not one).
+        from atom.privacy.hooks import tokenize_injected_text
+
+        content = tokenize_injected_text(msg.content, enabled=self.tokenize_emails)
         session.add_message(
             "assistant",
-            msg.content,
+            content,
             sender_id=msg.sender_id,
             injected_event="subagent_result",
             subagent_task_id=task_id,

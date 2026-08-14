@@ -40,13 +40,31 @@ class TokenEntry(TypedDict):
 #: additive and need no bump.
 SCHEMA_VERSION = 1
 
-#: The only type minted today. Kept as a field rather than implied so adding
-#: ``phone`` or ``person`` later is additive to a working format.
+#: A whole address, replaced as one unit — everywhere, including tool output.
+#:
+#: Splitting an address into its parts (``«user:…»@«domain:…»``) was considered
+#: and deferred: it would hide the domain too and shrink the map, but the naming
+#: was unsettled, and an entry type is written to disk — renaming one later means
+#: migrating live data. Revisit from a clean slate rather than half-introducing
+#: it. The cost of not having it: an agent cannot filter tool output by domain,
+#: since the domain is inside the placeholder.
 TYPE_EMAIL = "email"
 
 #: Shown to the model so it can recognize a placeholder. A literal example
 #: rather than a regex: models follow examples more reliably than patterns.
 TOKEN_PATTERN_HINT = "«email:a91f2c8d»"
+
+#: Upper bound on stored entries. Tool output is the reason this exists: a single
+#: ``grep -r "@"`` over a mail directory can carry thousands of addresses, and the
+#: map is append-only, so an unbounded map grows from data the agent merely
+#: passed over rather than data anyone chose to keep.
+MAX_ENTRIES = 10_000
+
+#: Substituted once :data:`MAX_ENTRIES` is reached. Deliberately not resolvable:
+#: leaving the plaintext in place instead would mean the map's size limit
+#: silently turns into a disclosure, which is the one outcome this feature exists
+#: to prevent. Data is lost rather than leaked, and the loss is logged.
+CAPPED_PLACEHOLDER = "«email:capped»"
 
 #: Deliberately loose on the local part and strict on the shape: a value that
 #: does not look like an address must not be replaced, since a wrong
@@ -126,6 +144,9 @@ class TokenStore:
         #: Set when the file exists but could not be parsed. Minting stays off
         #: for the process lifetime so a recoverable file is never overwritten.
         self._broken = False
+        #: Logged once rather than per value, or a single bulk tool result would
+        #: emit thousands of identical lines.
+        self._warned_full = False
 
     @property
     def path(self) -> Path:
@@ -183,7 +204,9 @@ class TokenStore:
         """Return the stable placeholder for *value*, minting one if needed.
 
         Returns None when the map is unreadable, so the caller leaves the value
-        in place rather than minting against state that cannot be saved.
+        in place rather than minting against state that cannot be saved. Returns
+        :data:`CAPPED_PLACEHOLDER` once the map is full — an unresolvable marker,
+        because leaving the plaintext would turn a size limit into a disclosure.
         """
         with self._lock:
             entries = self._load()
@@ -193,6 +216,19 @@ class TokenStore:
             existing = self._by_value.get(key)
             if existing is not None:
                 return existing
+
+            if len(entries) >= MAX_ENTRIES:
+                if not self._warned_full:
+                    self._warned_full = True
+                    logger.error(
+                        "Token map at {} holds {} entries; new values are being "
+                        "replaced with {} instead of being stored. Prune the file "
+                        "to resume tokenizing new values.",
+                        self.path,
+                        MAX_ENTRIES,
+                        CAPPED_PLACEHOLDER,
+                    )
+                return CAPPED_PLACEHOLDER
 
             token = self._mint(entity_type, entries)
             entries[token] = {"type": entity_type, "value": value}
@@ -231,7 +267,8 @@ def tokenize(text: str, store: TokenStore | None = None) -> str:
     """Replace email addresses in *text* with stable placeholders.
 
     Pure text in, pure text out, with no knowledge of channels or messages, so
-    the same call can later be applied to extracted document text or file reads.
+    the same call serves message text, tool output, subagent results and
+    transcription alike.
     """
     if not text or "@" not in text:
         return text

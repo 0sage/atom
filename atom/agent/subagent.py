@@ -103,6 +103,7 @@ class SubagentManager:
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
         fail_on_tool_error: bool | None = None,
+        tokenize_tool_results: bool = False,
     ):
         if workspace is None:
             raise TypeError("SubagentManager.__init__() missing required argument: 'workspace'")
@@ -133,6 +134,7 @@ class SubagentManager:
         self.bus = bus
         self.tools_config = tools_config or ToolsConfig()
         self.max_tool_result_chars = max_tool_result_chars
+        self.tokenize_tool_results = tokenize_tool_results
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
         self.max_iterations = (
@@ -409,6 +411,7 @@ class SubagentManager:
                     checkpoint_callback=_on_checkpoint,
                     session_key=sess_key,
                     workspace=root,
+                    tokenize_tool_results=self.tokenize_tool_results,
                 ))
             finally:
                 if token is not None:

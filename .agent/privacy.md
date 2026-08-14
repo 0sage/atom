@@ -181,14 +181,15 @@ Telegram's servers, and a deletion does not reach anyone who already saw it.
 
 ## What is implemented: email tokenization
 
-On by default (`privacy.tokenizeEmails`). An address becomes
-`«email:a91f2c8d»` on the way into the session and is resolved on the way out to
-the user:
+On by default (`privacy.tokenizeEmails`). An address becomes `«email:a91f2c8d»`
+wherever it enters the transcript, and is resolved on the way out to the user:
 
 ```
-ingress:  alex@example.com  →  «email:a91f2c8d»   (history + provider)
-egress:   «email:a91f2c8d»  →  alex@example.com   (Telegram, CLI)
-tools:    «email:a91f2c8d»  →  «email:a91f2c8d»   (unchanged)
+in  (user text):    alex@example.com  →  «email:a91f2c8d»
+in  (tool output):  alex@example.com  →  «email:a91f2c8d»
+    on disk + provider:                  «email:a91f2c8d»
+out (to the user):  «email:a91f2c8d»  →  alex@example.com
+    tool arguments:                      «email:a91f2c8d»  (unchanged)
 ```
 
 The rule is **who reads it**, not where it goes. The user owns the data and sent
@@ -213,13 +214,45 @@ Tokenizing on ingress covers history and every provider in one place.
 Slash commands are skipped: their arguments go to a command handler rather than
 a model, and `/secrets set` must reach the store byte-for-byte.
 
-### Files are deliberately untouched
+### Four ingress paths, because none of them shares a chokepoint
 
-A file already sits in the workspace, so replacing addresses in its extracted
-text would hide them from the model while `read_file` still returns the
-original — protection that isn't. Adding it later means calling `tokenize()` at
-`extract_text` *and* `read_file`; the map is shared, so an address already seen
-in a message keeps its token with no migration.
+An earlier version tokenized only message text, which protected the data the user
+already controls and left the bulk exposure open. `exec` running a query,
+`web_fetch` reading an endpoint, or an MCP mail server listing an inbox each
+carry hundreds of third-party addresses straight into history and the provider.
+
+| Path | Hook |
+| --- | --- |
+| user message text | `_process_message` → `tokenize_user_text` |
+| tool output | `normalize_tool_result` → `tokenize_tool_result` |
+| subagent results | `_persist_subagent_followup` → `tokenize_injected_text` |
+| voice transcription | covered by the message hook |
+
+`normalize_tool_result` (`context_governance.py:111`) covers `exec`,
+`web_fetch` and every MCP tool at once, because `MCPToolWrapper` is an ordinary
+`Tool` whose result flows through the same path. The hook runs *before* the
+`TOOL_RESULT_OFFLOAD_EXEMPT_TOOLS` early return and before
+`maybe_persist_tool_result`, so both the model copy and the offloaded file carry
+placeholders.
+
+Transcription needs no hook of its own: Telegram folds it into
+`InboundMessage.content` (`runtime.py:1308`) before `_process_message` runs.
+Verified, not assumed.
+
+Subagent results *should* already be tokenized — a subagent's prompt and tool
+results both pass through hooks — but they arrive on the `system` channel, which
+the user-text hook skips. The hook there is a backstop, and a no-op when the
+reasoning holds, since `tokenize` only matches addresses and a placeholder is not
+one.
+
+### Files are read through tools, so they are covered now
+
+The earlier "files are deliberately untouched" decision is superseded for
+practical purposes: `read_file` is a tool, so its output is tokenized like any
+other. The original objection — that the agent could read the original anyway —
+turned out to be answering the wrong question. What matters is not whether the
+agent *can* reach a value, but whether the value **lands in the transcript and
+goes to the provider**. Tool-result tokenization stops that, for files too.
 
 ### Tokens are random, not derived
 
@@ -236,6 +269,32 @@ another's. The value→token index is built in memory and never persisted.
 A corrupt map disables minting for the process rather than being overwritten: the
 file may be recoverable by hand, and rewriting it would strand every token
 already in saved history as an unresolvable placeholder.
+
+### The map is capped, and the cap loses data rather than leaking it
+
+`MAX_ENTRIES = 10_000`. Tool output is the reason: one `grep -r "@"` over a mail
+directory can carry thousands of addresses, and the map is append-only, so an
+uncapped map grows from data the agent merely passed over.
+
+At the cap, new values become `«email:capped»` — deliberately **not** resolvable.
+Leaving the plaintext in place instead would mean a size limit silently turns
+into a disclosure, which is the one outcome this feature exists to prevent. Data
+is lost rather than leaked, and the operator is told once (not per value, or a
+single bulk result would emit thousands of identical lines).
+
+Addresses already in the map keep resolving when the cap is reached.
+
+### Splitting an address into parts was considered and deferred
+
+`«user:…»@«domain:…»` would hide the domain too and shrink the map — one entry per
+domain instead of one per address — while still letting the agent group and
+filter by domain. It was half-built and then removed: the naming was unsettled
+(`local` vs `user` vs `alias`), and an entry `type` is written to disk, so
+renaming one later means migrating live data. Revisit from a clean slate.
+
+The cost of not having it: an agent cannot filter tool output by domain, because
+the domain is inside the placeholder. Grouping still works — two identical
+placeholders are the same person — and the runtime context block says so.
 
 ### The model must be told
 
@@ -256,12 +315,12 @@ stall a stream.
 Found by running the real agent. The unit tests passed throughout — they fed
 whole placeholders, which is the one case streaming never produces.
 
-### Three boundaries, not one
+### Four egress boundaries, not one
 
 `MessageBus.publish_outbound` covers everything reaching a channel through the
 bus. `process_direct` (used by `atom agent -m`, the API server, subagents)
 returns its result to the caller and drives its own callbacks, so it needs the
-same treatment in three places:
+same treatment in three more places:
 
 | Path | Resolved by |
 | --- | --- |
@@ -283,7 +342,7 @@ address.
 | `commands.py` | `/secrets` reply text and the delete-source request |
 | `env.py` | injection into `ExecTool._build_env` |
 | `tokens.py` | `tokens.json` — minting, both-direction lookup, `tokenize`/`detokenize` |
-| `hooks.py` | ingress boundary and the model-facing guidance block |
+| `hooks.py` | the ingress boundaries and the model-facing guidance block |
 | `stream.py` | placeholder resolution across stream-delta boundaries |
 
 Testing note: `conftest.py` redirects both `DEFAULT_SECRET_STORE` and
