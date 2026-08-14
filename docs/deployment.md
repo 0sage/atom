@@ -1,0 +1,173 @@
+# Deployment
+
+Use this page after `atom agent -m "Hello!"` works locally. Deployment keeps long-running surfaces online: chat apps, heartbeat, Dream, cron jobs, and channel connections.
+
+## Before You Deploy
+
+Check these once before installing a systemd unit or LaunchAgent:
+
+| Check | Why it matters |
+|---|---|
+| `atom status` shows the expected config and workspace | Confirms the process will read the instance you meant to run |
+| `atom agent -m "Hello!"` works | Proves install, config, provider, model, and workspace writes before adding a service layer |
+| Secrets are in environment variables or protected config files | API keys, bot tokens, OAuth state, and chat credentials should not be world-readable |
+| `~/.atom/` or your custom config/workspace path is persistent | Sessions, memory, channel login state, generated artifacts, and cron jobs live there |
+| Channel access control is intentional | Use `allowFrom`, pairing, or private test channels before exposing the bot |
+| Ports are planned | Gateway health defaults to local-only `127.0.0.1:18790`; `atom serve` defaults to `8900` |
+| Logs are easy to reach | Use `journalctl`, LaunchAgent log files, or `atom gateway --verbose` while diagnosing startup |
+
+Restart the deployed process after editing `config.json`. Long-running processes read config at startup.
+
+## Install
+
+atom is deployed with `uv` from this git repository. It is not published on PyPI,
+and the PyPI name `atom` belongs to an unrelated project, so always install from
+the git URL.
+
+```bash
+uv tool install "git+https://github.com/0sage/atom.git"
+```
+
+Pin a tag or commit for a reproducible deployment, and declare optional
+dependencies up front with `--with` so `uv tool upgrade` cannot drop them:
+
+```bash
+uv tool install \
+  --with "python-telegram-bot[socks,webhooks]>=22.6,<23.0" \
+  --with "socksio>=1.0.0,<2.0.0" \
+  --with "python-socks[asyncio]>=2.8.0,<3.0.0" \
+  "git+https://github.com/0sage/atom.git@main[api]"
+```
+
+Any git ref works after `@` — a branch, a tag, or a full commit SHA. A SHA is the
+only form that cannot move under you:
+
+```bash
+uv tool install "git+https://github.com/0sage/atom.git@0a810c9f"
+```
+
+Make sure the `uv` tool bin directory is on `PATH` (`uv tool update-shell`, or set
+`UV_TOOL_BIN_DIR` explicitly in a service unit).
+
+Upgrade in place:
+
+```bash
+uv tool upgrade atom
+```
+
+An unpinned git URL tracks the default branch, so `uv tool upgrade` fetches and
+rebuilds whatever `main` currently points at. Pin a tag or commit when you want
+upgrades to be an explicit decision.
+
+Anything installed at run time — `atom plugins enable ...`, or channel
+dependencies the gateway installs on first start — is not recorded in the tool
+receipt, so `uv tool upgrade` rebuilds the environment without it. Declare those
+requirements with `--with` for a deployment you intend to upgrade.
+
+## Choose a Runtime
+
+| Runtime | Use it for | State location | Useful first command |
+|---|---|---|---|
+| Foreground process | Testing a host before installing a service | `~/.atom` unless you pass explicit paths | `atom gateway --verbose` |
+| systemd user service | Linux user-level gateway that restarts automatically | Host user's `~/.atom` unless you pass explicit paths | `systemctl --user status atom-gateway` |
+| macOS LaunchAgent | macOS gateway that starts after login | Host user's `~/.atom` unless the plist passes explicit paths | `launchctl list \| grep ai.atom.gateway` |
+| Background process | Hosts without systemd or launchd (Alpine/OpenRC) | `~/.atom` unless you pass explicit paths | `atom gateway --background` |
+
+## Linux Service
+
+Run the gateway as a systemd user service so it starts automatically and restarts on failure.
+
+Preview the generated unit first:
+
+```bash
+atom gateway install-service --manager systemd --dry-run
+```
+
+Install, enable, and start it:
+
+```bash
+atom gateway install-service --manager systemd
+```
+
+For a custom instance, pass the same config/workspace selector you use to run the gateway:
+
+```bash
+atom gateway install-service \
+  --manager systemd \
+  --name atom-telegram \
+  --config ~/.atom-telegram/config.json \
+  --workspace ~/.atom-telegram/workspace
+```
+
+Common operations:
+
+```bash
+systemctl --user status atom-gateway        # check status
+systemctl --user restart atom-gateway       # restart after config changes
+journalctl --user -u atom-gateway -f        # follow logs
+atom gateway uninstall-service --manager systemd
+```
+
+The installer writes `~/.config/systemd/user/atom-gateway.service`, runs
+`systemctl --user daemon-reload`, enables the unit, and restarts it. It uses the
+current Python executable with `python -m atom gateway --foreground`, so the
+service runs in the same environment you used to install atom.
+
+> **Note:** User services only run while you are logged in. To keep the gateway running after logout, enable lingering:
+>
+> ```bash
+> loginctl enable-linger $USER
+> ```
+
+## Hosts Without systemd
+
+`install-service` needs `systemctl` or `launchd`; on Alpine or another OpenRC host
+it fails with `No such file or directory: 'systemctl'`. Use the built-in
+background mode there, supervised by whatever init the host actually runs:
+
+```bash
+atom gateway --background      # start detached
+atom gateway status            # running?, PID, port
+atom gateway logs              # recent output
+atom gateway stop              # stop it
+```
+
+## macOS LaunchAgent
+
+Use a LaunchAgent when you want `atom gateway` to stay online after you log in, without keeping a terminal open.
+
+Preview the generated plist first:
+
+```bash
+atom gateway install-service --manager launchd --dry-run
+```
+
+Install, load, enable, and start it:
+
+```bash
+atom gateway install-service --manager launchd
+```
+
+For a custom instance:
+
+```bash
+atom gateway install-service \
+  --manager launchd \
+  --name atom-telegram \
+  --config ~/.atom-telegram/config.json \
+  --workspace ~/.atom-telegram/workspace
+```
+
+Common operations:
+
+```bash
+launchctl list | grep ai.atom.gateway
+launchctl kickstart -k gui/$(id -u)/ai.atom.gateway
+atom gateway uninstall-service --manager launchd
+```
+
+The installer writes `~/Library/LaunchAgents/ai.atom.gateway.plist`, uses the
+current Python executable with `python -m atom gateway --foreground`, and
+writes LaunchAgent logs under `~/.atom/logs/`.
+
+> **Note:** if startup fails with "address already in use", stop the manually started `atom gateway` process first.
