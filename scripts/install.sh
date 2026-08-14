@@ -40,6 +40,15 @@ done
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# uv installs into ~/.local/bin, which is often absent from PATH in a
+# non-interactive shell. Prepend it before anything looks for uv or atom, or
+# --check reports "would install uv" on a host that already has it.
+UV_BIN="${HOME}/.local/bin"
+case ":${PATH}:" in
+    *":${UV_BIN}:"*) UV_BIN_ON_PATH=1 ;;
+    *) UV_BIN_ON_PATH=0; PATH="${UV_BIN}:${PATH}"; export PATH ;;
+esac
+
 # ---------------------------------------------------------------- inspect host
 step "Inspecting host"
 
@@ -147,13 +156,8 @@ else
         || die "uv install failed; see https://docs.astral.sh/uv/"
 fi
 
-# The uv installer puts binaries in ~/.local/bin, which is often not on PATH in
-# a non-interactive shell -- the most common reason a good install looks broken.
-UV_BIN="${HOME}/.local/bin"
-case ":${PATH}:" in
-    *":${UV_BIN}:"*) ON_PATH=1 ;;
-    *) ON_PATH=0; PATH="${UV_BIN}:${PATH}"; export PATH ;;
-esac
+# PATH already includes ${UV_BIN} (set during inspection), so a freshly
+# installed uv is visible here without re-checking.
 have uv || die "uv is installed but not on PATH; add ${UV_BIN} to PATH"
 
 # ---------------------------------------------------------------- install atom
@@ -172,7 +176,7 @@ say "  $(atom --version 2>&1)"
 # ------------------------------------------------------------------- next steps
 step "Installed"
 
-if [ "$ON_PATH" -eq 0 ]; then
+if [ "$UV_BIN_ON_PATH" -eq 0 ]; then
     warn "${UV_BIN} is not on your PATH in a fresh shell."
     warn "Add it, or run: uv tool update-shell"
     say ""
