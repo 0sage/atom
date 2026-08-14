@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from pathlib import Path
 
 from atom.utils.helpers import ensure_dir
@@ -31,6 +32,26 @@ def get_media_dir(channel: str | None = None) -> Path:
     """Return the media directory, optionally namespaced per channel."""
     base = get_runtime_subdir("media")
     return ensure_dir(base / channel) if channel else base
+
+
+def get_private_dir(create: bool = True) -> Path:
+    """Return the directory holding secret values, restricted to the owner.
+
+    Unlike the other runtime subdirectories this one holds plaintext secrets, so
+    the mode is tightened whenever it is created rather than left at the process
+    umask. Callers must not place agent-readable files here: the directory sits
+    under the instance data dir, which the workspace path resolver denies.
+
+    Pass ``create=False`` on read paths. Reads happen on hot paths such as
+    building a subprocess environment, and those must not have the side effect
+    of creating a directory — nor fail when the parent is not writable.
+    """
+    if not create:
+        return get_config_path().parent / "private"
+    path = get_runtime_subdir("private")
+    with suppress(OSError):
+        path.chmod(0o700)
+    return path
 
 
 def get_cron_dir() -> Path:

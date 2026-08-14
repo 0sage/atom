@@ -166,6 +166,14 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "[list|approve <code>|deny <code>|revoke <user_id>]",
         accepts_args=True,
     ),
+    BuiltinCommandSpec(
+        "/secrets",
+        "Manage secrets",
+        "List, store or remove secret values the agent can use without seeing them.",
+        "key-round",
+        "[set NAME=value|del NAME]",
+        accepts_args=True,
+    ),
 )
 
 
@@ -874,6 +882,23 @@ async def cmd_pairing(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_secrets(ctx: CommandContext) -> OutboundMessage:
+    """List, store or remove secret values.
+
+    Registered on the priority tier, so the arguments — which may carry a secret
+    value — are never written to session history and never reach the model.
+    """
+    from atom.privacy.commands import handle_secrets_command
+
+    reply = handle_secrets_command(ctx.args)
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=reply,
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
 async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
     """List all enabled skills (name and description only)."""
     loop = ctx.loop
@@ -989,3 +1014,10 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/help", cmd_help)
     router.exact("/pairing", cmd_pairing)
     router.prefix("/pairing ", cmd_pairing)
+    # Priority tier: arguments may carry a secret value, so dispatch must happen
+    # on the path that persists nothing to session history. Both spellings are
+    # registered because the singular is the natural typo.
+    router.priority("/secrets", cmd_secrets)
+    router.priority("/secret", cmd_secrets)
+    router.priority_prefix("/secrets ", cmd_secrets)
+    router.priority_prefix("/secret ", cmd_secrets)

@@ -57,20 +57,38 @@ class CommandContext:
 class CommandRouter:
     """Pure dict-based command dispatch.
 
-    Three tiers checked in order:
+    Four tiers checked in order:
       1. *priority* — exact-match commands handled before the dispatch lock
          (e.g. /stop, /restart).
-      2. *exact* — exact-match commands handled inside the dispatch lock.
-      3. *prefix* — longest-prefix-first match (e.g. "/team ").
+      2. *priority prefix* — argument-taking commands handled before the lock,
+         for input that must never be persisted to session history
+         (e.g. "/secrets ").
+      3. *exact* — exact-match commands handled inside the dispatch lock.
+      4. *prefix* — longest-prefix-first match (e.g. "/team ").
+
+    Priority tiers reach handlers through ``dispatch_priority``, which the agent
+    loop calls without a session, so neither the command text nor the reply is
+    written to history.
     """
 
     def __init__(self) -> None:
         self._priority: dict[str, Handler] = {}
+        self._priority_prefix: list[tuple[str, Handler]] = []
         self._exact: dict[str, Handler] = {}
         self._prefix: list[tuple[str, Handler]] = []
 
     def priority(self, cmd: str, handler: Handler) -> None:
         self._priority[cmd] = handler
+
+    def priority_prefix(self, pfx: str, handler: Handler) -> None:
+        """Register an argument-taking command on the pre-lock tier.
+
+        Use only for commands whose arguments must stay out of session history
+        and out of LLM context. Arguments are passed verbatim, without the
+        case folding applied to the command name.
+        """
+        self._priority_prefix.append((pfx, handler))
+        self._priority_prefix.sort(key=lambda p: len(p[0]), reverse=True)
 
     def exact(self, cmd: str, handler: Handler) -> None:
         self._exact[cmd] = handler
@@ -80,17 +98,20 @@ class CommandRouter:
         self._prefix.sort(key=lambda p: len(p[0]), reverse=True)
 
     def is_priority(self, text: str) -> bool:
-        return normalize_command_text(text).lower() in self._priority
+        cmd = normalize_command_text(text).lower()
+        if cmd in self._priority:
+            return True
+        return any(cmd.startswith(pfx) for pfx, _ in self._priority_prefix)
 
     def is_dispatchable_command(self, text: str) -> bool:
         """Check whether *text* should be handled by non-priority dispatch.
 
-        Exact priority commands are handled separately. Recognized non-priority
+        Priority commands are handled separately. Recognized non-priority
         commands and invalid slash commands are dispatched here so malformed
         commands can be rejected instead of reaching the LLM.
         """
         cmd = normalize_command_text(text).lower()
-        if cmd in self._priority:
+        if self.is_priority(text):
             return False
         if cmd in self._exact:
             return True
@@ -102,9 +123,16 @@ class CommandRouter:
     async def dispatch_priority(self, ctx: CommandContext) -> OutboundMessage | None:
         """Dispatch a priority command. Called from run() without the lock."""
         ctx.raw = normalize_command_text(ctx.raw)
-        handler = self._priority.get(ctx.raw.lower())
-        if handler:
+        cmd = ctx.raw.lower()
+        if handler := self._priority.get(cmd):
             return await handler(ctx)
+
+        for pfx, handler in self._priority_prefix:
+            if cmd.startswith(pfx):
+                # Slice the original, not the folded copy: arguments may carry a
+                # secret value whose case is significant.
+                ctx.args = ctx.raw[len(pfx):]
+                return await handler(ctx)
         return None
 
     async def dispatch(self, ctx: CommandContext) -> OutboundMessage | None:
@@ -132,7 +160,7 @@ class CommandRouter:
         if canonical is not None:
             accepts_args = any(
                 pfx.rstrip().lower() == entered.lower()
-                for pfx, _ in self._prefix
+                for pfx, _ in (*self._prefix, *self._priority_prefix)
             )
             if accepts_args:
                 content = (
@@ -166,5 +194,7 @@ class CommandRouter:
 
     def _registered_commands(self) -> dict[str, str]:
         commands = [*self._priority, *self._exact]
-        commands.extend(pfx.rstrip() for pfx, _ in self._prefix)
+        commands.extend(
+            pfx.rstrip() for pfx, _ in (*self._prefix, *self._priority_prefix)
+        )
         return {command.lower(): command for command in commands if command}

@@ -16,7 +16,11 @@ from loguru import logger
 from pydantic import Field
 
 from atom.agent.tools.base import Tool, ToolResult, tool_parameters
-from atom.agent.tools.context import ToolContext, current_request_session_key
+from atom.agent.tools.context import (
+    RequestContext,
+    ToolContext,
+    current_request_session_key,
+)
 from atom.agent.tools.exec_session import (
     DEFAULT_EXEC_SESSION_MANAGER,
     DEFAULT_MAX_OUTPUT_CHARS,
@@ -36,6 +40,7 @@ from atom.agent.tools.schema import (
 )
 from atom.config.paths import get_media_dir
 from atom.config_base import Base
+from atom.runtime_context import RuntimeContextBlock, wrap_runtime_context_lines
 from atom.security.workspace_access import current_scope_allows_loopback, current_tool_workspace
 from atom.security.workspace_policy import is_path_within
 
@@ -277,7 +282,60 @@ class ExecTool(Tool):
             "if the command keeps running, exec returns a session_id that can "
             "be polled or written to with write_stdin. Output is truncated at "
             "10 000 chars; timeout defaults to 60s."
+            f"{self._secrets_note()}"
         )
+
+    @staticmethod
+    def _secrets_note() -> str:
+        """Describe stored secrets the operator has made available.
+
+        Names only. The values are injected into the subprocess environment, so
+        the agent can use them without ever being told what they are.
+        """
+        try:
+            from atom.privacy.env import secret_names
+
+            names = secret_names()
+        except Exception:
+            return ""
+        if not names:
+            return ""
+        return (
+            " Operator-stored secrets are available as environment variables: "
+            f"{', '.join(names)}. "
+            "Reference them by name, e.g. \"$TOKEN\", so the shell expands them "
+            "in the subprocess; their values are deliberately not shown to you. "
+            "Never ask the user to paste a value that is already stored."
+        )
+
+    def runtime_context_provider(self):
+        return self._provide_runtime_context
+
+    async def _provide_runtime_context(
+        self,
+        request: RequestContext,
+    ) -> RuntimeContextBlock | None:
+        """Advertise stored secret names so the agent can reference them.
+
+        The tool description carries the same list, but it is cached per tool
+        schema; this refreshes each turn so a secret added mid-conversation is
+        usable without a restart.
+        """
+        try:
+            from atom.privacy.env import secret_names
+
+            names = secret_names()
+        except Exception:
+            return None
+        if not names:
+            return None
+        content = wrap_runtime_context_lines([
+            f"Available secrets (values withheld): {', '.join(names)}",
+            "Use them as $NAME in exec commands; do not ask the user for their values.",
+        ])
+        if not content:
+            return None
+        return RuntimeContextBlock(source="secrets", content=content)
 
     @property
     def exclusive(self) -> bool:
@@ -596,6 +654,10 @@ class ExecTool(Tool):
         On Unix, only HOME/LANG/TERM are passed by default. If callers request
         ``login=True``, bash/zsh may source the user's profile and add PATH or
         other variables.
+
+        Operator-stored secrets are added last and never override an existing
+        key, so the agent can reference them as ``$NAME`` without their values
+        ever entering a prompt.
         """
         home = os.environ.get("HOME", "/tmp")
         env = {
@@ -608,7 +670,9 @@ class ExecTool(Tool):
             val = os.environ.get(key)
             if val is not None:
                 env[key] = val
-        return env
+        from atom.privacy.env import inject_secrets
+
+        return inject_secrets(env)
 
     def _guard_command(
         self,
