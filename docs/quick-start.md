@@ -195,14 +195,20 @@ Replace the provider, endpoint, and model together. Do not pair a credential fro
 ## Updating
 
 ```bash
-uv tool upgrade atom
+atom upgrade
 ```
 
+This bumps the install and then restarts the gateway. The restart matters: a
+running gateway keeps the code it started with, so new files alone change
+nothing about the process answering messages, and its health check keeps
+reporting `ok` regardless. `uv tool upgrade atom` does the first half only.
+
 An unpinned git URL tracks the default branch, so an upgrade rebuilds whatever
-`main` currently points at. Anything installed at run time — `atom plugins enable
-...`, or channel dependencies the gateway installs on first start — is not
-recorded in the tool receipt and is dropped by an upgrade; declare those with
-`--with` instead.
+`main` currently points at; pass `--ref v0.10.1` to pin a tag instead. Anything
+installed at run time — `atom plugins enable ...`, or channel dependencies the
+gateway installs on first start — is not recorded in the tool receipt and a bare
+`uv tool upgrade` drops it; `atom upgrade` passes enabled channels' requirements
+back through `--with` so they survive.
 
 For a source checkout:
 

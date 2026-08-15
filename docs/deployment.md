@@ -66,17 +66,34 @@ Make sure the `uv` tool bin directory is on `PATH` (`uv tool update-shell`, or s
 Upgrade in place:
 
 ```bash
-uv tool upgrade atom
+atom upgrade                 # bumps the install, then restarts the gateway
+atom upgrade --ref v0.10.1   # pin a tag instead of tracking main
+atom upgrade --dry-run       # print the command it would run
 ```
 
-An unpinned git URL tracks the default branch, so `uv tool upgrade` fetches and
-rebuilds whatever `main` currently points at. Pin a tag or commit when you want
-upgrades to be an explicit decision.
+**Upgrading the files is only half of it.** A running gateway holds the
+interpreter and modules it started with, so new bytes on disk change nothing
+about the process serving traffic — and its `/health` keeps answering `ok` the
+whole time. On one host a service ran 0.8.x for eighteen minutes after 0.9.0 was
+installed, with nothing reporting a problem. `atom upgrade` restarts the service
+for exactly this reason; `uv tool upgrade atom` cannot.
+
+The restart is attempted even when the version did not change, because "already
+up to date" describes the files and says nothing about the process — a host with
+new files and a stale service is the case this exists for. Pass `--no-restart` to
+skip it, and expect the old code to keep running until something else restarts it.
+
+Under the hood the plan adapts to how atom was installed (`uv` tool, pipx, or a
+venv), and refuses rather than guessing for a source checkout or a layout it does
+not recognize: the wrong command can uninstall a working install.
 
 Anything installed at run time — `atom plugins enable ...`, or channel
 dependencies the gateway installs on first start — is not recorded in the tool
-receipt, so `uv tool upgrade` rebuilds the environment without it. Declare those
-requirements with `--with` for a deployment you intend to upgrade.
+receipt, so a bare `uv tool upgrade` rebuilds the environment without it.
+`atom upgrade` passes the requirements of *enabled* channels back through
+`--with`, so a channel does not go dark across an upgrade. Enabled channels also
+repair their own dependencies on the next gateway start, so a channel that does
+go quiet comes back with the restart.
 
 ## Choose a Runtime
 

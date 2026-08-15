@@ -76,7 +76,8 @@ Python interpreter — you do not need a matching system Python.
 | `atom: command not found` | Run `uv tool update-shell` and open a new terminal, or call it as `uv tool run --from "git+https://github.com/0sage/atom.git" atom ...`. |
 | Could not reach `github.com` | Your network, proxy, or firewall blocked the git fetch. Configure the proxy for git, then rerun `uv tool install`. |
 | `No solution found` or a build failure | Run `uv python list`; `uv` needs to resolve or download a Python 3.11+ interpreter, which requires network access on first use. |
-| An optional feature disappeared after upgrade | `uv tool upgrade` rebuilds the environment from the recorded requirements. Reinstall with the extra declared through `--with`. |
+| An optional feature disappeared after upgrade | A bare `uv tool upgrade` rebuilds the environment from the recorded requirements only. Use `atom upgrade`, which passes enabled channels' requirements back through `--with`; enabled channels also repair themselves on the next gateway start. |
+| Behaviour did not change after an upgrade | The gateway is still running the old code: a long-lived process keeps the modules it started with, and `/health` reports `ok` regardless. Run `atom upgrade` (it restarts the service), or restart it yourself. Compare `atom --version` against the `Starting atom gateway version ...` line in the service log. |
 | Source checkout does not pick up edits | From the repo root, run `uv sync --all-extras --dev`, then check `uv run --no-sync atom --version`. |
 
 ## Config Problems

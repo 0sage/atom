@@ -29,7 +29,9 @@ atom, then stops: it writes no config and starts no service. Flags go after
 `-s --` (`--check` to change nothing, `--ref v0.8.2` to pin). Already have `uv`?
 `uv tool install "git+https://github.com/0sage/atom.git"`.
 
-Upgrade with `uv tool upgrade atom`.
+Upgrade with `atom upgrade`. It bumps the install *and* restarts the gateway,
+which `uv tool upgrade atom` cannot do — a running gateway keeps the code it
+started with, and goes on reporting healthy while it does.
 
 ## Docs
 
