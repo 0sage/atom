@@ -1401,6 +1401,13 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
+        # Token usage counters are advanced in memory and flushed on a timer, so
+        # a clean shutdown between flushes would otherwise drop them. The
+        # mappings themselves are already durable; this only saves the metadata.
+        if self.tokenize_emails:
+            from atom.privacy.tokens import DEFAULT_TOKEN_STORE
+
+            DEFAULT_TOKEN_STORE.flush()
         logger.info("Agent loop stopping")
 
     async def _process_message(

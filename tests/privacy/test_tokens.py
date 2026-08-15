@@ -11,6 +11,7 @@ from atom.privacy import tokens as tokens_module
 from atom.privacy.tokens import (
     SCHEMA_VERSION,
     TYPE_EMAIL,
+    UNKNOWN_TIMESTAMP,
     TokenStore,
     canonical_email,
     detokenize,
@@ -195,6 +196,137 @@ class TestFileFormat:
             })
         )
         assert store.value_for("«email:aaaaaaaa»") == "ok@example.com"
+
+
+class TestUsageMetadata:
+    """``created``/``last_used``/``hits`` exist to make the map prunable.
+
+    At ``MAX_ENTRIES`` an operator has to choose what to drop, and without a
+    last-used stamp the only options are deleting the file — which strands every
+    token in saved history — or keeping it forever. Nothing evicts automatically:
+    dropping an entry makes its placeholder unresolvable wherever it was already
+    written, so the choice stays with a person.
+    """
+
+    def test_mint_records_creation(self, store: TokenStore) -> None:
+        token = tokenize("alex@example.com")
+        entry = json.loads(store.path.read_text())["entries"][token]
+        assert entry["created"].endswith("Z")
+        assert entry["last_used"] == entry["created"]
+        assert entry["hits"] == 0, "minting is not a use"
+
+    def test_resolving_counts_as_a_use(self, store: TokenStore) -> None:
+        token = tokenize("alex@example.com")
+        for _ in range(3):
+            detokenize(token)
+        store.flush()
+        entry = json.loads(store.path.read_text())["entries"][token]
+        assert entry["hits"] == 3
+
+    def test_unresolved_token_does_not_count(self, store: TokenStore) -> None:
+        token = tokenize("alex@example.com")
+        detokenize("«email:deadbeef»")
+        store.flush()
+        entry = json.loads(store.path.read_text())["entries"][token]
+        assert entry["hits"] == 0
+
+    def test_first_use_is_written_through(self, store: TokenStore) -> None:
+        """The first resolution flushes rather than waiting out the interval.
+
+        Deliberate: a process that resolves a token once and exits would
+        otherwise persist nothing unless something called ``flush``, and the
+        write is cheap precisely because it happens once.
+        """
+        token = tokenize("alex@example.com")
+        detokenize(token)
+        assert json.loads(store.path.read_text())["entries"][token]["hits"] == 1
+
+    def test_burst_after_the_first_is_deferred(self, store: TokenStore) -> None:
+        """Detokenization runs per stream delta; writing through every one would
+        fsync the plaintext map hundreds of times for a single reply."""
+        token = tokenize("alex@example.com")
+        detokenize(token)  # opens the throttle window
+        before = store.path.stat().st_mtime_ns
+        for _ in range(50):
+            detokenize(token)
+        assert store.path.stat().st_mtime_ns == before, "no write inside the window"
+        assert store._load()[token]["hits"] == 51, "but every use is counted"
+
+    def test_flush_persists_counters_held_in_memory(self, store: TokenStore) -> None:
+        token = tokenize("alex@example.com")
+        detokenize(token)
+        for _ in range(4):
+            detokenize(token)
+        assert json.loads(store.path.read_text())["entries"][token]["hits"] == 1
+        store.flush()
+        assert json.loads(store.path.read_text())["entries"][token]["hits"] == 5
+
+    def test_flush_is_a_no_op_without_pending_writes(self, store: TokenStore) -> None:
+        tokenize("alex@example.com")
+        before = store.path.stat().st_mtime_ns
+        store.flush()
+        assert store.path.stat().st_mtime_ns == before
+
+
+class TestUsageMetadataBackCompat:
+    """A v1 file predating these fields must stay readable, unbumped.
+
+    The fields are metadata about a mapping rather than part of one, so an old
+    file is not a breaking change: the parser backfills what it cannot know.
+    """
+
+    def _write_legacy(self, store: TokenStore) -> str:
+        token = "«email:aaaaaaaa»"
+        store.path.write_text(
+            json.dumps({
+                "version": 1,
+                "entries": {token: {"type": "email", "value": "old@example.com"}},
+            })
+        )
+        return token
+
+    def test_legacy_entry_still_resolves(self, store: TokenStore) -> None:
+        token = self._write_legacy(store)
+        assert store.value_for(token) == "old@example.com"
+
+    def test_missing_created_is_marked_unknown_not_now(self, store: TokenStore) -> None:
+        """Backfilling the load time would make every old entry look fresh and
+        destroy the signal the field exists to carry."""
+        token = self._write_legacy(store)
+        store.value_for(token)
+        assert store._load()[token]["created"] == UNKNOWN_TIMESTAMP
+
+    def test_legacy_entry_starts_counting_from_zero(self, store: TokenStore) -> None:
+        token = self._write_legacy(store)
+        store.value_for(token)
+        store.flush()
+        assert json.loads(store.path.read_text())["entries"][token]["hits"] == 1
+
+    def test_bool_is_not_accepted_as_a_count(self, store: TokenStore) -> None:
+        """bool subclasses int, so a hand-edited `true` would otherwise count."""
+        token = "«email:aaaaaaaa»"
+        store.path.write_text(
+            json.dumps({
+                "version": 1,
+                "entries": {
+                    token: {
+                        "type": "email", "value": "x@example.com", "hits": True,
+                    },
+                },
+            })
+        )
+        assert store._load()[token]["hits"] == 0
+
+    def test_entry_built_in_process_does_not_break_egress(
+        self, store: TokenStore,
+    ) -> None:
+        """_touch runs on the path that resolves placeholders for the user, so a
+        missing counter must not turn a reply into a KeyError."""
+        token = "«email:bbbbbbbb»"
+        store._entries = {token: {"type": "email", "value": "y@example.com"}}  # pyright: ignore[reportArgumentType] — deliberately partial
+        store._by_value = {("email", "y@example.com"): token}
+        assert store.value_for(token) == "y@example.com"
+        assert store._load()[token]["hits"] == 1
 
 
 class TestNoPlaintextLeftBehind:

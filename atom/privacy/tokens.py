@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, TypedDict, cast
@@ -31,14 +33,45 @@ TOKENS_FILENAME = "tokens.json"
 
 
 class TokenEntry(TypedDict):
-    """One persisted mapping. ``type`` is stored so new kinds are additive."""
+    """One persisted mapping. ``type`` is stored so new kinds are additive.
+
+    ``created``/``last_used`` are UTC ISO-8601 and ``hits`` counts resolutions.
+    They exist to make the map prunable: at :data:`MAX_ENTRIES` an operator has
+    to decide what to drop, and without a last-used stamp the only options are
+    "delete the file" — which strands every token in saved history — or keep it
+    forever. They also answer the question the cap raises on its own: whether a
+    full map is full of live entities or of addresses the agent skimmed once.
+
+    Deliberately *not* used for automatic eviction. Dropping an entry makes every
+    placeholder for it unresolvable wherever it was already written, so which
+    entries die is an operator's call, not a heuristic's.
+    """
 
     type: str
     value: str
+    created: str
+    last_used: str
+    hits: int
 
 #: Bumped only for a breaking change to the file's shape. Entry *types* are
 #: additive and need no bump.
+#:
+#: Adding the usage fields did not bump it: a v1 file written before they existed
+#: stays readable, since :func:`_parse_entries` backfills them from the values it
+#: has. A reader that ignores them is also still correct — they are metadata about
+#: a mapping, not part of it.
 SCHEMA_VERSION = 1
+
+#: Written when a pre-usage-fields entry is read back and its real creation time
+#: is unknowable. A sentinel rather than "now", because backfilling the load time
+#: would make every old entry look freshly minted and quietly destroy the signal
+#: the field exists to carry.
+UNKNOWN_TIMESTAMP = "unknown"
+
+#: Usage counters are flushed at most this often. Detokenization runs per stream
+#: delta, so writing on every resolution would turn one reply into hundreds of
+#: fsyncs on the file holding the plaintext map.
+_FLUSH_INTERVAL_SECONDS = 30.0
 
 #: A whole address, replaced as one unit — everywhere, including tool output.
 #:
@@ -104,9 +137,33 @@ def _parse_entries(raw: object) -> dict[str, TokenEntry]:
         fields = cast(dict[str, Any], entry)
         value = fields.get("value")
         entity_type = fields.get("type")
-        if isinstance(value, str) and isinstance(entity_type, str):
-            entries[token] = {"type": entity_type, "value": value}
+        if not isinstance(value, str) or not isinstance(entity_type, str):
+            continue
+        # type and value are load-bearing; the usage fields are not, so a file
+        # written before they existed — or hand-edited to drop one — is read
+        # rather than discarded. Missing stamps become UNKNOWN_TIMESTAMP instead
+        # of the load time, which would make every old entry look new.
+        created = fields.get("created")
+        last_used = fields.get("last_used")
+        hits = fields.get("hits")
+        entries[token] = {
+            "type": entity_type,
+            "value": value,
+            "created": created if isinstance(created, str) else UNKNOWN_TIMESTAMP,
+            "last_used": last_used if isinstance(last_used, str) else UNKNOWN_TIMESTAMP,
+            # bool is an int subclass, so it would otherwise pass as a count.
+            "hits": hits if isinstance(hits, int) and not isinstance(hits, bool) else 0,
+        }
     return entries
+
+
+def _utc_now() -> str:
+    """UTC ISO-8601 with a ``Z`` suffix, second resolution.
+
+    Second resolution because this is for an operator reading the file, and
+    sub-second noise on every entry makes it harder to scan for nothing.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def canonical_email(value: str) -> str:
@@ -147,6 +204,11 @@ class TokenStore:
         #: Logged once rather than per value, or a single bulk tool result would
         #: emit thousands of identical lines.
         self._warned_full = False
+        #: Usage counters bumped in memory but not yet on disk, and when they
+        #: were last flushed. Minting still writes immediately — losing a token
+        #: loses data, whereas losing a hit count loses a statistic.
+        self._usage_dirty = False
+        self._last_flush = 0.0
 
     @property
     def path(self) -> Path:
@@ -231,7 +293,17 @@ class TokenStore:
                 return CAPPED_PLACEHOLDER
 
             token = self._mint(entity_type, entries)
-            entries[token] = {"type": entity_type, "value": value}
+            now = _utc_now()
+            entries[token] = {
+                "type": entity_type,
+                "value": value,
+                "created": now,
+                # Seeded to `created` rather than left blank so the field always
+                # answers "when was this last relevant" without a null case; a
+                # minted-but-never-resolved entry reads as hits: 0.
+                "last_used": now,
+                "hits": 0,
+            }
             self._by_value[key] = token
             self._save()
             return token
@@ -250,10 +322,74 @@ class TokenStore:
         raise RuntimeError("Could not mint an unused token")
 
     def value_for(self, token: str) -> str | None:
-        """Return the value behind *token*, or None when it is not in the map."""
+        """Return the value behind *token*, or None when it is not in the map.
+
+        Records the resolution. The write is deferred (see :meth:`_touch`), so a
+        lookup stays a lookup as far as latency is concerned.
+        """
         with self._lock:
             entry = self._load().get(token)
-        return entry["value"] if entry is not None else None
+            if entry is None:
+                return None
+            self._touch(entry)
+            return entry["value"]
+
+    def _touch(self, entry: TokenEntry) -> None:
+        """Record one resolution, flushing at most once per interval.
+
+        Caller holds the lock. Counters are advanced in memory immediately and
+        persisted on a timer: detokenization runs once per stream delta, so
+        writing through would mean hundreds of rewrites of the plaintext map for
+        a single reply. A crash costs at most one interval of counters, which is
+        the right thing to lose — the mappings themselves are already durable
+        because minting writes synchronously.
+        """
+        # Read defensively rather than by subscript: this runs on the egress path
+        # that resolves placeholders for the user, and an entry reaching here
+        # without the usage keys must not turn a reply into a KeyError. The
+        # parser backfills anything loaded from disk, so this covers entries
+        # constructed in process.
+        # A non-int `hits` cannot reach here: the parser coerces it on load and
+        # the type says int, so `.get`'s default covers the only real case —
+        # a key that was never set.
+        entry["hits"] = entry.get("hits", 0) + 1
+        entry["last_used"] = _utc_now()
+        entry.setdefault("created", UNKNOWN_TIMESTAMP)
+        self._usage_dirty = True
+        now = time.monotonic()
+        # `_last_flush` starts at 0.0, so the first resolution writes through and
+        # only the burst behind it is throttled. That is the useful shape: a
+        # process that resolves a token once and exits still records it without
+        # depending on anything calling `flush`, and one write is cheap. The
+        # window then absorbs a stream's worth of deltas.
+        if now - self._last_flush < _FLUSH_INTERVAL_SECONDS:
+            return
+        self._last_flush = now
+        self._flush_usage()
+
+    def _flush_usage(self) -> None:
+        """Persist pending counters. Caller holds the lock.
+
+        Failure is logged and swallowed: usage metadata is not worth failing a
+        turn over, and the counters stay in memory to go out with the next flush.
+        """
+        if not self._usage_dirty or self._broken:
+            return
+        try:
+            self._save()
+        except OSError as exc:
+            logger.warning("Could not persist token usage counters: {}", exc)
+            return
+        self._usage_dirty = False
+
+    def flush(self) -> None:
+        """Persist pending usage counters now.
+
+        Public because the deferred write has one bad ending: a process that
+        exits between flushes drops counters that were only ever in memory.
+        """
+        with self._lock:
+            self._flush_usage()
 
     def __len__(self) -> int:
         with self._lock:

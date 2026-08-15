@@ -266,6 +266,49 @@ all that was ever required.
 correctness depends on: a wrong lookup shows one person's data in place of
 another's. The value→token index is built in memory and never persisted.
 
+### Each entry carries usage metadata
+
+```json
+"«email:692bf756»": {
+  "type": "email",
+  "value": "alex@example.com",
+  "created": "2026-08-15T10:01:12Z",
+  "last_used": "2026-08-15T10:04:38Z",
+  "hits": 3
+}
+```
+
+The three usage fields exist to make the map **prunable**. At `MAX_ENTRIES` an
+operator has to decide what to drop, and without a last-used stamp the only
+options are deleting the file — which strands every token in saved history as an
+unresolvable placeholder — or keeping it forever. They also answer the question
+the cap raises on its own: whether a full map holds live entities or addresses
+the agent skimmed past once.
+
+Nothing evicts automatically, deliberately. Dropping an entry makes its
+placeholder unresolvable everywhere it was already written, including sessions
+closed months ago, so which entries die is an operator's call and not a
+heuristic's.
+
+- **Minting is not a use.** A fresh entry is `hits: 0` with `last_used` seeded to
+  `created`, so the field always answers "when was this last relevant" without a
+  null case, and a minted-but-never-resolved entry is visible as such.
+- **Writes are throttled, not written through.** Detokenization runs once per
+  stream delta, so persisting every resolution would mean hundreds of rewrites of
+  the plaintext map for one reply. The first resolution writes through and the
+  burst behind it is absorbed for `_FLUSH_INTERVAL_SECONDS`; `AgentLoop.stop`
+  flushes what is left. A crash costs at most one interval of *counters* — the
+  mappings are already durable, because minting writes synchronously.
+- **No schema bump.** These are metadata about a mapping rather than part of one,
+  so a v1 file written before they existed stays readable: `_parse_entries`
+  backfills the fields it cannot know. A missing `created` becomes
+  `UNKNOWN_TIMESTAMP`, never the load time — backfilling "now" would make every
+  old entry look freshly minted and destroy the signal the field exists to carry.
+
+`_touch` reads `hits` through `.get` rather than by subscript because it sits on
+the egress path that resolves placeholders for the user: an entry constructed
+in-process without the usage keys must not turn a reply into a `KeyError`.
+
 The map file is self-neutralizing when read back through a tool, which is what
 makes the agent's reach into it survivable. An entry's `value` is the plaintext
 keyed by its own token, so `cat tokens.json` passes through the tool-result hook
