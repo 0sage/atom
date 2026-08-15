@@ -170,16 +170,17 @@ def plan_upgrade(
     extras = channel_requirements() if include_channels else ()
 
     if resolved == "uv-tool":
-        if ref:
-            # A pinned ref is a reinstall, not an upgrade: `uv tool upgrade`
-            # takes no source, so asking for a tag has to go through install.
-            command: tuple[str, ...] = (
-                "uv", "tool", "install", "--force", f"git+{repo}@{ref}",
-            )
+        # `uv tool upgrade` accepts neither a source nor `--with` — it rejects
+        # the flag outright ("unexpected argument '--with' found"). So anything
+        # beyond "bump atom alone" has to go through `install --force`, which
+        # takes both. Verified against uv 0.12.5 rather than inferred.
+        if ref or extras:
+            target = f"git+{repo}@{ref}" if ref else f"git+{repo}"
+            command: tuple[str, ...] = ("uv", "tool", "install", "--force", target)
+            for requirement in extras:
+                command = (*command, "--with", requirement)
         else:
             command = ("uv", "tool", "upgrade", "atom")
-        for requirement in extras:
-            command = (*command, "--with", requirement)
         return UpgradePlan(resolved, command, extras)
 
     if resolved == "pipx":
@@ -308,9 +309,17 @@ def run_upgrade(
     )
 
     # Restarting is the whole point: without it the files on disk are new and the
-    # process serving traffic is not. Skipped when nothing changed, so a no-op
-    # upgrade does not drop a live connection for nothing.
-    if restart_service and result.changed:
+    # process serving traffic is not.
+    #
+    # Attempted even when the version did not change, which looks wasteful and is
+    # not. "Already up to date" describes the *files*, and says nothing about the
+    # process — the case that motivated this whole command was a host with new
+    # files and a service still running the old ones, where skipping the restart
+    # on "no change" would strand it there permanently. A restart of an already
+    # current gateway costs a few seconds of downtime; not restarting a stale one
+    # costs correctness, silently. The restarter reports "nothing to restart"
+    # when no service is installed, so a terminal-only install is unaffected.
+    if restart_service:
         restarter = service_restarter or restart_gateway_service
         try:
             restarted, message = restarter()

@@ -617,15 +617,20 @@ def upgrade(
             f"[green]Upgraded[/green] {result.version_before} → {result.version_after}"
         )
     else:
-        console.print(f"[green]Already up to date[/green] ({result.version_before})")
+        # Says "files" on purpose: a gateway started before this version was
+        # installed is still running the old code, so "already up to date" about
+        # the install would read as a claim about the process too.
+        console.print(
+            f"[green]Files already up to date[/green] ({result.version_before})"
+        )
 
     if result.service_message:
         style = "green" if result.service_restarted else "yellow"
         console.print(f"[{style}]{result.service_message}[/{style}]")
-    elif result.changed and not restart:
+    elif not restart:
         console.print(
-            "[yellow]Gateway not restarted; it keeps running the old code until "
-            "it does.[/yellow]"
+            "[yellow]Gateway not restarted; a running one keeps the old code "
+            "until it is.[/yellow]"
         )
 
 

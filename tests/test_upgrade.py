@@ -89,18 +89,29 @@ class TestPlanUpgrade:
         assert plan.command[:4] == ("uv", "tool", "install", "--force")
         assert plan.command[4].endswith("@v0.9.0")
 
-    def test_channel_requirements_ride_along(self, monkeypatch) -> None:
-        """uv rebuilds the tool env from atom's own metadata, dropping anything
-        injected later. Passing them means the channel never goes dark at all."""
+    def test_channel_requirements_force_the_install_form(self, monkeypatch) -> None:
+        """`uv tool upgrade` rejects --with outright, so extras must go through
+        `install --force`, which accepts both a source and --with.
+
+        Found live: the upgrade form failed with "unexpected argument '--with'
+        found" against uv 0.12.5.
+        """
         monkeypatch.setattr(
             "atom.upgrade.channel_requirements",
             lambda: ("python-telegram-bot>=22.6,<23.0", "socksio>=1.0.0,<2.0.0"),
         )
         plan = plan_upgrade(method="uv-tool", include_channels=True)
         assert plan.command is not None
-        assert plan.command[:4] == ("uv", "tool", "upgrade", "atom")
+        assert plan.command[:4] == ("uv", "tool", "install", "--force")
+        assert "upgrade" not in plan.command
         assert plan.command.count("--with") == 2
         assert "python-telegram-bot>=22.6,<23.0" in plan.command
+
+    def test_plain_upgrade_form_when_there_are_no_extras(self, monkeypatch) -> None:
+        """Without extras the cheaper `upgrade` form is correct and is used."""
+        monkeypatch.setattr("atom.upgrade.channel_requirements", lambda: ())
+        plan = plan_upgrade(method="uv-tool", include_channels=True)
+        assert plan.command == ("uv", "tool", "upgrade", "atom")
 
     def test_channels_can_be_skipped(self, monkeypatch) -> None:
         monkeypatch.setattr(
@@ -139,8 +150,14 @@ class TestRunUpgrade:
         assert result.version_after == "0.9.0"
         assert restarts == [True], "new code on disk is not new code running"
 
-    def test_no_restart_when_nothing_changed(self) -> None:
-        """A no-op upgrade must not drop a live connection for nothing."""
+    def test_restart_happens_even_when_the_version_did_not_change(self) -> None:
+        """"Already up to date" describes the files, not the process.
+
+        The case that motivated this command was a host with new files and a
+        service still running the old ones. Skipping the restart on "no change"
+        would strand exactly that host permanently, so the restart is attempted
+        either way — reproduced live before this was changed.
+        """
         restarts: list[bool] = []
         runner = FakeRunner([(0, ""), (0, "0.8.4")])
         result = run_upgrade(
@@ -150,7 +167,7 @@ class TestRunUpgrade:
             service_restarter=lambda: (restarts.append(True) or (True, "Restarted.")),
         )
         assert result.ok and not result.changed
-        assert restarts == []
+        assert restarts == [True]
 
     def test_version_is_read_from_a_fresh_process(self) -> None:
         """This process imported atom before the upgrade, so its __version__ is
