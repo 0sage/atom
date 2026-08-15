@@ -559,6 +559,77 @@ def plugins_disable(
 
 
 # ============================================================================
+# Upgrade
+# ============================================================================
+
+
+@app.command()
+def upgrade(
+    ref: str | None = typer.Option(
+        None, "--ref", help="Pin a tag, branch, or commit instead of the latest main"
+    ),
+    restart: bool = typer.Option(
+        True,
+        "--restart/--no-restart",
+        help="Restart the gateway service so the new code is what runs",
+    ),
+    channels: bool = typer.Option(
+        True,
+        "--channels/--no-channels",
+        help="Reinstall dependencies for enabled channels alongside atom",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the command, change nothing"),
+):
+    """Upgrade atom in place and restart the gateway.
+
+    The restart is the part worth having: upgrading the files leaves a running
+    gateway executing the code it started with, and it keeps reporting healthy
+    while it does.
+    """
+    from atom import __version__
+    from atom.upgrade import plan_upgrade, run_upgrade
+
+    plan = plan_upgrade(ref=ref, include_channels=channels)
+    console.print(f"{__logo__} atom v{__version__} — install method: {plan.method}")
+
+    if not plan.can_upgrade:
+        console.print(f"[yellow]{plan.refusal}[/yellow]")
+        raise typer.Exit(1)
+
+    console.print(f"Running: {' '.join(plan.command or ())}\n")
+    result = run_upgrade(
+        plan,
+        version_before=__version__,
+        restart_service=restart,
+        dry_run=dry_run,
+    )
+
+    if not result.ok:
+        console.print(f"[red]{result.message}[/red]")
+        raise typer.Exit(1)
+
+    if dry_run:
+        console.print("[green]Dry run; nothing was changed.[/green]")
+        return
+
+    if result.changed:
+        console.print(
+            f"[green]Upgraded[/green] {result.version_before} → {result.version_after}"
+        )
+    else:
+        console.print(f"[green]Already up to date[/green] ({result.version_before})")
+
+    if result.service_message:
+        style = "green" if result.service_restarted else "yellow"
+        console.print(f"[{style}]{result.service_message}[/{style}]")
+    elif result.changed and not restart:
+        console.print(
+            "[yellow]Gateway not restarted; it keeps running the old code until "
+            "it does.[/yellow]"
+        )
+
+
+# ============================================================================
 # Status Commands
 # ============================================================================
 

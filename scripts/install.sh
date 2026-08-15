@@ -161,7 +161,17 @@ fi
 have uv || die "uv is installed but not on PATH; add ${UV_BIN} to PATH"
 
 # ---------------------------------------------------------------- install atom
-step "Installing atom from ${REPO}@${REF}"
+# Distinguish a first install from a re-run over an existing one. `uv tool
+# install --force` does both, but they have different consequences: an upgrade
+# leaves a running gateway executing the code it started with, which the closing
+# hint has to say out loud.
+VERSION_BEFORE=""
+if have atom; then
+    VERSION_BEFORE="$(atom --version 2>&1 | tail -1)"
+    step "Upgrading atom (${VERSION_BEFORE}) from ${REPO}@${REF}"
+else
+    step "Installing atom from ${REPO}@${REF}"
+fi
 
 TARGET="git+${REPO}@${REF}"
 [ "$WITH_API" -eq 1 ] && TARGET="${TARGET}[api]"
@@ -216,7 +226,11 @@ if [ "$UV_BIN_ON_PATH" -eq 0 ]; then
 fi
 
 # ------------------------------------------------------------------- next steps
-step "Installed"
+if [ -n "$VERSION_BEFORE" ]; then
+    step "Upgraded"
+else
+    step "Installed"
+fi
 
 if [ "$UV_BIN_ON_PATH" -eq 0 ]; then
     say "${UV_BIN} was added to your PATH, but only for shells started from now on."
@@ -224,6 +238,37 @@ if [ "$UV_BIN_ON_PATH" -eq 0 ]; then
     say ""
     say "  export PATH=\"${UV_BIN}:\$PATH\""
     say ""
+fi
+
+# An upgrade and a first install need opposite advice, and the wrong one is
+# actively misleading: telling someone with a live gateway that "no service is
+# running" invites them to install a second one, while walking a fresh host
+# through a restart names a unit that does not exist.
+if [ -n "$VERSION_BEFORE" ]; then
+    say "atom was upgraded in place. Your config and workspace were left alone."
+    say ""
+    say "A gateway that was already running is still running the OLD code: a"
+    say "long-lived process keeps the modules it started with, and it goes on"
+    say "reporting healthy while it does. Restart it to pick this version up:"
+    say ""
+    say "  atom upgrade                 # from here on, does both steps for you"
+    say ""
+    case "$INIT" in
+        systemd)
+            if [ "$IS_ROOT" -eq 1 ]; then
+                say "  systemctl restart atom-gateway"
+            else
+                say "  systemctl --user restart atom-gateway"
+            fi
+            ;;
+        launchd) say "  launchctl kickstart -k gui/\$(id -u)/ai.atom.atom-gateway" ;;
+        *)       say "  restart however you started it" ;;
+    esac
+    say ""
+    say "Enabled channels repair their own dependencies on the next start, so a"
+    say "channel that goes quiet across an upgrade comes back with the restart."
+    say ""
+    exit 0
 fi
 
 say "atom is installed. Nothing is configured and no service is running."
