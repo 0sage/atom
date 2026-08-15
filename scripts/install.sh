@@ -173,12 +173,56 @@ uv tool install --force "$TARGET" >/dev/null 2>&1 \
 have atom || die "atom installed but not on PATH; add ${UV_BIN} to PATH"
 say "  $(atom --version 2>&1)"
 
+# ------------------------------------------------------------------ persist PATH
+# Everything above found atom only because line 49 prepended UV_BIN to this
+# process's PATH. That does not outlive the script, so without this step the
+# install "succeeds" and then the next shell reports `atom: command not found`.
+#
+# `uv tool update-shell` is the documented cure and cannot do it from here: the
+# prepend already happened, so uv sees UV_BIN in PATH and reports "already in
+# PATH" without writing anything. Removing the prepend does not help either —
+# uv then needs $SHELL to pick a profile, and a piped `curl | sh` has none, so
+# it fails with "the current shell could not be determined". Both were verified
+# on a fresh Debian container. Hence: write the line ourselves.
+if [ "$UV_BIN_ON_PATH" -eq 0 ]; then
+    step "Adding ${UV_BIN} to PATH"
+
+    # Which file a login shell actually reads differs per shell, and root on
+    # Debian gets no ~/.local/bin block the way a normal user does. Write to the
+    # rc file for the login shell when we can name it, and always to ~/.profile,
+    # which sh and bash both read when it exists.
+    RC_FILES="${HOME}/.profile"
+    case "${SHELL:-}" in
+        */zsh)  RC_FILES="${RC_FILES} ${HOME}/.zshrc" ;;
+        */bash) RC_FILES="${RC_FILES} ${HOME}/.bashrc" ;;
+        *)      [ -f "${HOME}/.bashrc" ] && RC_FILES="${RC_FILES} ${HOME}/.bashrc" ;;
+    esac
+
+    PATH_LINE="export PATH=\"${UV_BIN}:\$PATH\""
+    for rc in $RC_FILES; do
+        # Idempotent: re-running the installer must not stack duplicate lines.
+        if [ -f "$rc" ] && grep -qF "$PATH_LINE" "$rc" 2>/dev/null; then
+            say "  already set: ${rc}"
+            continue
+        fi
+        if printf '\n# added by atom installer: uv installs executables here\n%s\n' \
+               "$PATH_LINE" >> "$rc" 2>/dev/null; then
+            say "  updated: ${rc}"
+        else
+            warn "could not write ${rc}; add this line yourself:"
+            warn "  ${PATH_LINE}"
+        fi
+    done
+fi
+
 # ------------------------------------------------------------------- next steps
 step "Installed"
 
 if [ "$UV_BIN_ON_PATH" -eq 0 ]; then
-    warn "${UV_BIN} is not on your PATH in a fresh shell."
-    warn "Add it, or run: uv tool update-shell"
+    say "${UV_BIN} was added to your PATH, but only for shells started from now on."
+    say "In this one, either open a new shell or run:"
+    say ""
+    say "  export PATH=\"${UV_BIN}:\$PATH\""
     say ""
 fi
 
