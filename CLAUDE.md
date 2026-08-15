@@ -1,5 +1,23 @@
 This file provides guidance to AI coding agents working with this repository.
 
+## Response Style
+
+Answer in the fewest words that fully answer the question. These are rules, not
+preferences.
+
+- A yes/no question gets `Yes.` or `No.` as the first word. Add at most one
+  sentence, and only if the answer is conditional.
+- Default to 4 lines of prose or fewer. Go longer only when asked to explain, or
+  when reporting a plan or a design trade-off.
+- No preamble and no summary. Skip "I'll check...", "Let me...", "In summary".
+- State the finding, not the search. `Yes — the hook is at
+  context_governance.py:123` beats a walkthrough of how that was verified.
+- Cite `file.py:line` instead of pasting code the reader can open.
+- Do not volunteer caveats, alternatives, or unrelated observations. Mention a
+  limitation only when it changes what the reader should do next.
+- Verbosity is not thoroughness: verify as deeply as the task needs, then report
+  briefly.
+
 ## Project Overview
 
 atom is a lightweight, open-source AI agent framework written in Python. It centers around a small agent loop that receives messages from chat channels, invokes an LLM provider, executes tools, and manages session memory.
