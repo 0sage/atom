@@ -19,19 +19,17 @@ atom is not published on PyPI, and the PyPI name `atom` belongs to an unrelated
 project — always install from the git URL.
 
 ```bash
-uv tool install "git+https://github.com/0sage/atom.git"
+curl -LsSf https://github.com/0sage/atom/raw/main/scripts/install.sh | sh
 atom onboard --wizard
 atom agent -m "Hello!"
 ```
 
+The installer adds the prerequisites, [`uv`](https://docs.astral.sh/uv/), and
+atom, then stops: it writes no config and starts no service. Flags go after
+`-s --` (`--check` to change nothing, `--ref v0.8.2` to pin). Already have `uv`?
+`uv tool install "git+https://github.com/0sage/atom.git"`.
+
 Upgrade with `uv tool upgrade atom`.
-
-Don't have [`uv`](https://docs.astral.sh/uv/)? Install it first, then open a new
-terminal so it lands on your `PATH`:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
 
 ## Docs
 
