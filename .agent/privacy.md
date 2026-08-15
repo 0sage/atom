@@ -266,6 +266,19 @@ all that was ever required.
 correctness depends on: a wrong lookup shows one person's data in place of
 another's. The value→token index is built in memory and never persisted.
 
+The map file is self-neutralizing when read back through a tool, which is what
+makes the agent's reach into it survivable. An entry's `value` is the plaintext
+keyed by its own token, so `cat tokens.json` passes through the tool-result hook
+and comes back as `"value": "«email:d3522a34»"` — the file describes its own
+contents in placeholder terms. This is a property of the hook, not of the file:
+a map minted while tokenization was on stays plaintext on disk after it is
+switched off, and nothing rewrites it then. Both directions are pinned in
+`test_token_tool_results.py::TestMapFileIsSelfNeutralizing`.
+
+`secrets.env` has no equivalent property — its values are not addresses, so no
+hook matches them and a read returns them verbatim. That is the accepted risk
+recorded above, not an oversight.
+
 A corrupt map disables minting for the process rather than being overwritten: the
 file may be recoverable by hand, and rewriting it would strand every token
 already in saved history as an unresolvable placeholder.

@@ -145,6 +145,41 @@ class TestInjectedText:
         assert tokenize_injected_text("", enabled=True) == ""
 
 
+class TestMapFileIsSelfNeutralizing:
+    """Reading tokens.json through a tool cannot disclose what it maps.
+
+    The map is the one file holding plaintext addresses, and the agent can reach
+    it whenever workspace restriction is off. That is survivable only because of
+    a property worth pinning: an entry's ``value`` is the plaintext keyed by its
+    own token, so the tool-result hook rewrites it into that same token. The file
+    describes its own contents in placeholder terms.
+    """
+
+    def test_reading_the_map_yields_tokens_not_addresses(
+        self, store: TokenStore, tmp_path,
+    ) -> None:
+        token = tokenize_tool_result(EMAIL)
+        raw = (tmp_path / "tokens.json").read_text()
+        assert EMAIL in raw, "precondition: the map holds plaintext on disk"
+
+        seen = tokenize_tool_result(raw)
+        assert EMAIL not in seen
+        assert token in seen
+
+    def test_disabled_leaves_the_map_readable(
+        self, store: TokenStore, tmp_path,
+    ) -> None:
+        """The property belongs to the hook, not the file — turning it off loses it.
+
+        A map minted while tokenization was on stays plaintext on disk after it is
+        switched off, and nothing rewrites it then. Recorded so the guarantee is
+        not read as stronger than it is.
+        """
+        tokenize_tool_result(EMAIL)
+        raw = (tmp_path / "tokens.json").read_text()
+        assert EMAIL in tokenize_injected_text(raw, enabled=False)
+
+
 class TestSizeCap:
     """Bulk tool output is why this exists: the map is append-only."""
 
