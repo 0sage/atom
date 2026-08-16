@@ -630,8 +630,41 @@ nothing about what happens when it matches.
 
 This satisfies the marker-gate rule above: the gate is the alternation's own
 prefilter. `bench_privacy` covers it with `mask_registry_{1,100,1000}` and
-`mask_hits_100`; `TestMaskLookupIsIndexed` pins the index, including the two places
-it is maintained by hand.
+`mask_hits_{1,100,1000}`; `TestMaskLookupIsIndexed` pins the index, including the
+two places it is maintained by hand.
+
+### Checking whether the mask gate is stale must not walk the map
+
+The same blind spot, one layer up, and this one was worse. `mask_pattern()` is
+called once per `tokenize`, and it decided whether its cached regex was stale by
+building a signature tuple over every entry in the map. So the *gate* was O(map
+size), on every message, for every operator — **including those who have never run
+`/mask` and have no masks at all**. Clean text with zero masks declared measured
+0.38µs against an empty map and 141µs against 10,000 entries.
+
+`_mask_dirty` replaced it: a flag set at the three places the mask set can change
+(`_load`, `token_for` when the type is not email, `remove_mask`). Flat at 0.21µs
+across map sizes 0 → 10,000. The trade is that a signature cannot go stale by
+omission while a flag can, so the writers are deliberately few and each one carries
+a comment saying why it sets the flag.
+
+Two things about how this was found are worth keeping:
+
+- **`no_match_baseline` could not catch it, because it runs against an empty map.**
+  The case that matters is a *populated* map with *no masks* — the common
+  configuration — which is now `no_match_at_map_size_{0,1000,10000}`, gated at
+  10,000.
+- **The ladder is what surfaced it.** It appeared as a uniform 1.5–1.9× on
+  `no_match_baseline` across all four rungs. The absolute was 300ns against a 0.1ms
+  gate, so no gate failed and the number was trivially small; what made it worth
+  chasing was that it moved *identically on every rung*, which noise does not do.
+  A ratio that consistent is a real added step even when the magnitude looks like
+  nothing.
+
+`TestMaskGateDoesNotWalkTheMap` pins both halves — the cached path is O(1), and
+each of the three writers invalidates. Its scaling assertion is a ratio against the
+store's own small-map cost rather than an absolute, so it means the same on a Pi as
+on a dev machine; verified to fail 285× over when the signature check is restored.
 
 ### Removal strands existing placeholders, and says so
 

@@ -744,6 +744,102 @@ class TestDeclaredMasks:
         )
 
 
+class TestMaskGateDoesNotWalkTheMap:
+    """``mask_pattern`` runs once per :func:`tokenize`, so its cached path is hot.
+
+    Deciding the cache was stale by building a signature over every entry made an
+    operator who has never run ``/mask`` pay per entry: clean text cost 0.38us
+    against an empty map and 141us against 10,000 — the marker gate was more
+    expensive than the work it was guarding. A dirty flag replaced it, so these
+    pin both halves: the flag is not set when nothing changed, and it *is* set at
+    each of the three places the mask set moves.
+    """
+
+    def test_the_pattern_is_not_rebuilt_when_nothing_changed(
+        self, store: TokenStore
+    ) -> None:
+        store.add_mask(TYPE_NAME, "Alexey")
+        first = store.mask_pattern()
+        assert first is not None
+        assert store.mask_pattern() is first
+
+    def test_minting_an_address_does_not_rebuild_the_pattern(
+        self, store: TokenStore
+    ) -> None:
+        """Addresses are not masks, so they must not invalidate the alternation."""
+        store.add_mask(TYPE_NAME, "Alexey")
+        first = store.mask_pattern()
+        store.token_for(TYPE_EMAIL, "alex@example.com")
+        assert store.mask_pattern() is first
+
+    def test_the_empty_answer_is_cached_too(self, store: TokenStore) -> None:
+        """The no-masks case is the common one; it must not recheck per call."""
+        assert store.mask_pattern() is None
+        store.token_for(TYPE_EMAIL, "alex@example.com")
+        assert store.mask_pattern() is None
+
+    def test_adding_a_mask_rebuilds(self, store: TokenStore) -> None:
+        store.add_mask(TYPE_NAME, "Alexey")
+        first = store.mask_pattern()
+        store.add_mask(TYPE_SURNAME, "Smirnov")
+        second = store.mask_pattern()
+        assert second is not None and second is not first
+        assert second.search("Smirnov") is not None
+
+    def test_removing_a_mask_rebuilds(self, store: TokenStore) -> None:
+        store.add_mask(TYPE_NAME, "Alexey")
+        store.add_mask(TYPE_SURNAME, "Smirnov")
+        store.mask_pattern()
+        store.remove_mask("Smirnov")
+        rebuilt = store.mask_pattern()
+        assert rebuilt is not None
+        assert rebuilt.search("Smirnov") is None
+        assert rebuilt.search("Alexey") is not None
+
+    def test_removing_the_last_mask_rebuilds_to_none(self, store: TokenStore) -> None:
+        store.add_mask(TYPE_NAME, "Alexey")
+        assert store.mask_pattern() is not None
+        store.remove_mask("Alexey")
+        assert store.mask_pattern() is None
+
+    def test_a_reload_rebuilds(self, store: TokenStore) -> None:
+        """A pattern compiled before the map was read was built from another set."""
+        store.add_mask(TYPE_NAME, "Alexey")
+        reopened = TokenStore(path=store.path)
+        pattern = reopened.mask_pattern()
+        assert pattern is not None and pattern.search("Alexey") is not None
+
+    def test_the_cached_path_does_not_scale_with_map_size(
+        self, store: TokenStore
+    ) -> None:
+        """Pins the actual defect: no masks declared, cost independent of entries.
+
+        Asserted as a ratio against the store's own small-map cost rather than an
+        absolute, so it means the same on a Pi as on a dev machine. The old code
+        was ~370x here, so a generous bound still fails it.
+        """
+        import time
+
+        text = "the build succeeded after retrying the flaky test twice. " * 20
+
+        def best_ns(iterations: int = 200) -> int:
+            for _ in range(50):
+                tokenize(text, store=store)
+            samples = []
+            for _ in range(iterations):
+                start = time.perf_counter_ns()
+                tokenize(text, store=store)
+                samples.append(time.perf_counter_ns() - start)
+            return min(samples)
+
+        small = best_ns()
+        with store.minting_batch():
+            for i in range(5_000):
+                store.token_for(TYPE_EMAIL, f"user{i}@example.com")
+        large = best_ns()
+        assert large < small * 4, f"{small}ns at 0 entries, {large}ns at 5000"
+
+
 class TestMaskLookupIsIndexed:
     """``token_for_mask`` runs once per matched occurrence, so it must not scan.
 

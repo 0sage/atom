@@ -117,6 +117,10 @@ BUDGETS: dict[str, tuple[str, str, float]] = {
     # construction (the alternation prefilters) and so cannot fail a regression in
     # how a match resolves back to its token. 400 hits per call.
     "mask_hits_1000": ("p95_ms", "at_most", 8.0),
+    # Clean text, no masks declared, against a full map — the configuration almost
+    # every operator runs. Gated because `no_match_baseline` uses an empty map and
+    # so passed while this cost 141us per call on a 10,000-entry map.
+    "no_match_at_map_size_10000": ("p95_ms", "at_most", 2.0),
 }
 
 
@@ -849,6 +853,46 @@ def case_mask_hits(count: int) -> CaseFn:
     return run
 
 
+def case_no_match_at_map_size(count: int) -> CaseFn:
+    """The no-match path against a map holding *count* entries and no masks.
+
+    :func:`case_no_match_baseline` runs against an empty map, which is why it could
+    not see the defect this case exists for: the mask gate decided whether its
+    cached pattern was stale by building a signature over every entry, so ordinary
+    clean text cost 0.38us at 0 entries and 141us at 10,000 — and an operator who
+    has never run ``/mask`` was paying all of it. An empty map hides that entirely.
+
+    No masks are declared on purpose. That is the common configuration, and it is
+    the one where the gate must cost nothing.
+    """
+
+    def run(workdir: Path) -> Sample:
+        store = TokenStore(path=workdir / "tokens.json")
+        with store.minting_batch():
+            for i in range(count):
+                store.token_for(TYPE_EMAIL, f"user{i}@example.com")
+        text = "the build succeeded after retrying the flaky test twice. " * 200
+        for _ in range(WARMUP_ITERATIONS):
+            tokenize(text, store)
+        latencies: list[float] = []
+        with _counting_io() as io:
+            start = time.perf_counter_ns()
+            for _ in range(500):
+                op = time.perf_counter_ns()
+                tokenize(text, store)
+                latencies.append((time.perf_counter_ns() - op) / 1e6)
+            total = time.perf_counter_ns() - start
+        return Sample(
+            total_ms=total / 1e6,
+            ops=500,
+            latencies_ms=latencies,
+            io=io,
+            notes={"map_entries": count, "masks": 0, "text_chars": len(text)},
+        )
+
+    return run
+
+
 def case_no_match_baseline() -> CaseFn:
     """Text with no ``@`` and no ``«`` — the case almost every call is.
 
@@ -1031,6 +1075,8 @@ def build_cases(quick: bool, deadline_s: float) -> dict[str, CaseFn]:
     cases["stream_char_by_char"] = case_stream_char_by_char()
     cases["stream_unclosed"] = case_stream_unclosed()
     cases["no_match_baseline"] = case_no_match_baseline()
+    for n in [0, 1_000, 10_000]:
+        cases[f"no_match_at_map_size_{n}"] = case_no_match_at_map_size(n)
     for n in [1, 100, 1_000]:
         cases[f"mask_registry_{n}"] = case_mask_registry(n)
     for n in [1, 100, 1_000]:
