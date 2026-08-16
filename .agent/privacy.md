@@ -343,6 +343,28 @@ map to `MAX_ENTRIES` with 9,948 synthetic addresses, which also capped real
 tokenization. Anything that constructs a `TokenStore` outside pytest is on the
 path the suite cannot see.
 
+### The usage stamp is cached for the second it describes
+
+`_utc_now` formats a second-resolution string, and `_touch` called it once per
+resolution — so a reply carrying 200 placeholders formatted 200 identical stamps.
+Measured: `strftime` 1.36us against 0.03us for the rest of `_touch` combined, 87%
+of `detokenize`'s total cost. Caching it made egress 2.5-3.5x faster across the
+ladder (Pi 44,932 -> 157,870 placeholders/second).
+
+**Not a disk problem, which is worth recording because the obvious guess was
+wrong twice.** The first hypothesis was that `_touch`'s throttled flush rewrote
+the map during a burst; 100k resolutions wrote the map *zero* times. The cost was
+never I/O — the same mistake as predicting fsync would dominate minting.
+
+The cache is only correct because the stamp is deliberately second-resolution (see
+the field docs above). It is module-level rather than per store, since the value
+depends only on the clock, and unlocked: the worst a race does is have two threads
+format the same second and assign the same tuple. `_stamp_cache` is lowercase
+because it is reassigned — basedpyright rejects rebinding an uppercase name.
+
+Minting benefited too (Pi bulk 22,725 -> 39,118/second): every new entry stamps
+`created` and `last_used`, so it paid the same cost per value.
+
 ### Minting saves once per call, not once per value
 
 `_save` reserializes the entire map, so saving per newly minted value made

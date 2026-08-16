@@ -8,7 +8,7 @@ the numbers are dominated by the host:
 python3 -m scripts.bench_privacy --repeats 3 --deadline 45 \
   --label 4-nano-lxc-rpi --out /tmp/new.json
 python3 -m scripts.compare_bench \
-  benchmarks/baselines/v0.10.5-4-nano-lxc-rpi.json /tmp/new.json
+  benchmarks/baselines/v0.10.6-4-nano-lxc-rpi.json /tmp/new.json
 ```
 
 Files are named `<version>-<rung>.json`. Keep the old file when adding a new
@@ -31,6 +31,24 @@ share the host CPU, so a concurrent local run corrupts both sets of numbers.
 | 2 | `atom-debian` Lima VM (ext4) | first honest fsync cost, Linux semantics |
 | 3 | incus container inside the `incus` VM | container filesystem layers |
 | 4 | `atom` container on `nano` | ARM + flash storage: the revealing rung |
+
+## v0.10.6 — cached timestamp on the egress path (2026-08-16)
+
+`_utc_now` caches the second it describes. Profiling the Pi's weak egress number
+found `_touch` was 87% of `detokenize`, and `strftime` was 94% of that — the same
+second-resolution string formatted once per placeholder. No disk was involved:
+100k resolutions wrote the map zero times, which disproved the earlier guess that
+the throttled flush was to blame.
+
+| case | Pi (LXC) | incus-in-VM | lima VM | macOS |
+| --- | --- | --- | --- | --- |
+| `detokenize_rate_1s` | 157,870/s | 1.84M/s | 1.85M/s | 1.85M/s |
+| — vs v0.10.5 | 3.5× | 2.5× | 2.5× | 3.5× |
+| `detokenize_10000` | 259 ms | 43 ms | 43 ms | 42 ms |
+
+`mint_rate_bulk_1s` also improved (Pi 22,725/s → 39,118/s) because minting stamps
+`created` and `last_used` per entry and paid the same cost. The warm path is flat,
+as expected — it never touches a timestamp.
 
 ## v0.10.5 — batched minting (2026-08-16)
 
