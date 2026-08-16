@@ -113,6 +113,10 @@ BUDGETS: dict[str, tuple[str, str, float]] = {
     # over 35KB locally); the ceiling is set well above that to allow for flash
     # and ARM without admitting linear growth in the registry size.
     "mask_registry_1000": ("p95_ms", "at_most", 5.0),
+    # The hit path, gated separately because the miss path above is flat by
+    # construction (the alternation prefilters) and so cannot fail a regression in
+    # how a match resolves back to its token. 400 hits per call.
+    "mask_hits_1000": ("p95_ms", "at_most", 8.0),
 }
 
 
@@ -804,6 +808,11 @@ def case_mask_hits(count: int) -> CaseFn:
     Separate from :func:`case_mask_registry` because a miss is regex work only,
     while a hit also resolves the literal back to its token. The gap between the
     two is what a mask costs when it fires.
+
+    Run at more than one registry size on purpose. The resolve step cannot use the
+    ``(type, value)`` index — the alternation carries neither — and the first
+    implementation scanned the whole map per hit, which only a large registry
+    exposes. Having this case at 100 alone would not have caught it.
     """
 
     def run(workdir: Path) -> Sample:
@@ -811,7 +820,14 @@ def case_mask_hits(count: int) -> CaseFn:
         with store.minting_batch():
             for i in range(count):
                 store.add_mask(TYPE_NAME, f"Person{i:04d}Name")
-        text = "Person0001Name met Person0002Name about the report. " * 200
+        # Indexed modulo *count* so every referenced name is actually registered.
+        # Hardcoding two names measures nothing at count=1 — the alternation misses
+        # and the case silently becomes a duplicate of `mask_registry_1`.
+        names = [f"Person{i % count:04d}Name" for i in range(400)]
+        text = "".join(
+            f"{names[i]} met {names[(i + 1) % 400]} about the report. "
+            for i in range(0, 400, 2)
+        )
         for _ in range(WARMUP_ITERATIONS):
             tokenize(text, store)
         latencies: list[float] = []
@@ -1017,7 +1033,8 @@ def build_cases(quick: bool, deadline_s: float) -> dict[str, CaseFn]:
     cases["no_match_baseline"] = case_no_match_baseline()
     for n in [1, 100, 1_000]:
         cases[f"mask_registry_{n}"] = case_mask_registry(n)
-    cases["mask_hits_100"] = case_mask_hits(100)
+    for n in [1, 100, 1_000]:
+        cases[f"mask_hits_{n}"] = case_mask_hits(n)
     cases["regex_pathological"] = case_regex_pathological()
     for threads in [2, 8]:
         cases[f"concurrent_{threads}"] = case_concurrent(threads)

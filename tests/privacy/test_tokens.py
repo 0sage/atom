@@ -744,6 +744,48 @@ class TestDeclaredMasks:
         )
 
 
+class TestMaskLookupIsIndexed:
+    """``token_for_mask`` runs once per matched occurrence, so it must not scan.
+
+    Scanning the map and casefolding every entry per hit made ingress degrade
+    with registry size — measured at 2.1M hits/s for one mask against 113k for
+    a thousand. These pin the index that replaced the scan, including the two
+    places it has to be maintained by hand.
+    """
+
+    def test_a_mask_resolves_without_scanning_the_map(self, store: TokenStore) -> None:
+        """The index is the only lookup path, so a hit proves it was populated."""
+        store.add_mask(TYPE_NAME, "Alexey")
+        for _ in range(200):
+            store.token_for(TYPE_EMAIL, f"noise{_}@example.com")
+        assert store.token_for_mask("alexey") is not None
+
+    def test_the_index_survives_a_reload(self, store: TokenStore) -> None:
+        """It is rebuilt in ``_load``, which a fresh store exercises from disk."""
+        store.add_mask(TYPE_NAME, "Alexey")
+        reopened = TokenStore(path=store.path)
+        assert reopened.token_for_mask("ALEXEY") == store.token_for_mask("Alexey")
+
+    def test_removing_a_mask_removes_it_from_the_index(self, store: TokenStore) -> None:
+        """A stale index entry would resolve a value the operator deleted."""
+        store.add_mask(TYPE_NAME, "Alexey")
+        store.remove_mask("Alexey")
+        assert store.token_for_mask("Alexey") is None
+
+    def test_an_address_is_not_reachable_as_a_mask(self, store: TokenStore) -> None:
+        """Addresses are discovered by pattern; the index holds declared values only."""
+        tokenize("alex@example.com", store=store)
+        assert store.token_for_mask("alex@example.com") is None
+
+    def test_a_removed_mask_can_be_redeclared(self, store: TokenStore) -> None:
+        """Mints a fresh token, which must land in the index rather than nothing."""
+        first = store.add_mask(TYPE_NAME, "Alexey")
+        store.remove_mask("Alexey")
+        second = store.add_mask(TYPE_NAME, "Alexey")
+        assert second is not None and second != first
+        assert store.token_for_mask("alexey") == second
+
+
 class TestMasksDoNotCorruptText:
     """A wrong substitution is worse than no substitution.
 

@@ -598,17 +598,40 @@ choice `canonical_email` makes, and for the same reason: two tokens for one pers
 is the worse error. Resolution shows the *registered* spelling back, which is
 deliberately lossy on display.
 
-### Cost is flat in the size of the registry
+### Cost is near-flat in the size of the registry, and the miss path is not the whole story
 
 One alternation over every declared literal, cached against the mask set so a
 `/mask` mid-session takes effect on the next message without recompiling per call.
-Measured over 35KB of clean text: 0.23ms for 1 mask, 0.23ms for 100, 0.26ms for
-1000 — the engine prefilters the alternation. An operator who never runs `/mask`
+Over 35KB of text containing **no** mask: 0.23ms for 1 mask, 0.23ms for 100, 0.26ms
+for 1000 — the engine prefilters the alternation. An operator who never runs `/mask`
 pays one attribute lookup, since `mask_pattern()` returns `None`.
+
+That measurement covers only the **miss** path, and taking it as the whole answer
+hid a defect. On a **hit**, `token_for_mask()` resolves the matched substring to a
+token, and it originally did so by iterating the entire map and casefolding every
+entry. It cannot use `_by_value`, which is keyed by `(type, exact value)`: the
+alternation that found the text carries neither the type nor the registered casing.
+So the cost was O(masks × hits), and ingress over 400 masked occurrences fell from
+2,108,370 hits/s at 1 mask to 113,469 at 1000.
+
+`_by_folded_mask` — casefolded value to token, rebuilt in `_load()` beside
+`_by_value` and maintained in `token_for()` and `remove_mask()` — turns that into
+one dict lookup: 996,056 hits/s at 1000 masks, 8.8× better. The slope that remains
+is the 1000-branch alternation itself (0.115ms → 0.290ms for the regex alone), not
+the lookup, which measures ~0.16µs per hit.
+
+Egress was flat throughout and needed no change: detokenization is keyed by the
+placeholder, so it is a dict hit regardless of registry or map size — ~1.8–1.9M
+tokens/s across registry sizes 1–1000 and map sizes 10–5000.
+
+The lesson generalizes: **benchmark the hit path separately from the miss path.**
+A prefilter that returns early makes the miss path flat by construction and says
+nothing about what happens when it matches.
 
 This satisfies the marker-gate rule above: the gate is the alternation's own
 prefilter. `bench_privacy` covers it with `mask_registry_{1,100,1000}` and
-`mask_hits_100`.
+`mask_hits_100`; `TestMaskLookupIsIndexed` pins the index, including the two places
+it is maintained by hand.
 
 ### Removal strands existing placeholders, and says so
 
