@@ -434,6 +434,42 @@ targeted shapes.
 The domain side has a nested quantifier that *looks* worse and is not: it is
 anchored by literal dots, and measured linear.
 
+### Every new pattern must declare a cheap marker gate
+
+Written before a second pattern exists, because the structure has to be right
+*first*: this cliff is the kind of thing found after three patterns ship, by which
+point the design is already wrong.
+
+`tokenize` returns immediately when `"@" not in text`. That guard is why
+address-free text — almost every message and most tool output — costs nothing.
+Measured on 35 KB of clean text:
+
+| approach | cost |
+| --- | --- |
+| today, email only, early exit | 0.001 ms |
+| 8 patterns, always scan | 3.482 ms |
+| 8 patterns, one combined regex | 5.313 ms |
+| 8 patterns, cheap marker prefilter | 0.638 ms |
+
+Losing the early exit is a ~3,500× regression on the path every turn takes. So:
+**a pattern declares a substring or character-class marker, and only runs when its
+marker is present.** Phone numbers, IBANs and card numbers are the hard cases —
+they have no distinctive literal — and each needs an explicit decision rather than
+a default of "scan always".
+
+**A combined alternation is not the answer**, which is worth stating because it is
+the intuitive design. Measured *slower* than sequential passes on clean text
+(5.3 ms vs 3.5 ms for 8 patterns): one large NFA with many branches costs more per
+character than several cheap ones that mostly fail on their first byte.
+
+Per-pattern ingress cost is otherwise unremarkable — 0.4–0.7 ms each over 39 KB,
+roughly additive.
+
+**Egress already scales for free.** `_TOKEN_RE` is `«([a-z]+):([0-9a-f]{8})»` — the
+pattern count does not appear in it, so `detokenize` is independent of how many
+entity types exist. That is a property of the placeholder format, and a reason not
+to change it casually.
+
 ### The map is capped, and the cap loses data rather than leaking it
 
 `MAX_ENTRIES = 10_000`. Tool output is the reason: one `grep -r "@"` over a mail
