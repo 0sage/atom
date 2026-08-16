@@ -33,7 +33,7 @@ from atom.bus.events import OUTBOUND_META_DELETE_SOURCE, OutboundMessage
 from atom.bus.outbound_events import ProgressEvent
 from atom.bus.queue import MessageBus
 from atom.channels.base import BaseChannel
-from atom.command.builtin import build_help_text
+from atom.command.builtin import BUILTIN_COMMAND_SPECS, build_help_text
 from atom.config.paths import get_media_dir
 from atom.config.schema import Base
 from atom.security.network import validate_url_target
@@ -430,30 +430,25 @@ class TelegramChannel(BaseChannel):
     name = "telegram"
     display_name = "Telegram"
 
-    # Commands registered with Telegram's command menu
+    #: Commands offered in Telegram's command menu, derived from the shared spec
+    #: list rather than written out here.
+    #:
+    #: It used to be a hand-maintained literal, and it drifted: ``/mask``,
+    #: ``/secrets`` and ``/evaluator-prompt`` were registered in the router, listed
+    #: by ``/help``, and absent from this list — so they never appeared in the menu.
+    #: Deriving it means a new command cannot be added to atom and forgotten here.
+    #:
+    #: Telegram only accepts ``[a-z0-9_]`` in a command name, so a hyphenated atom
+    #: command is advertised with underscores and mapped back by
+    #: :meth:`_normalize_telegram_command`.
     BOT_COMMANDS: list[BotCommand] = [
+        # Telegram-specific: not an atom command, handled by `_on_start`.
         BotCommand("start", "Start the bot"),
-        BotCommand("new", "Start a new conversation"),
-        BotCommand("stop", "Stop the current task"),
-        BotCommand("restart", "Restart the bot"),
-        BotCommand("status", "Show bot status"),
-        BotCommand("history", "Show recent conversation messages"),
-        BotCommand("trigger", "Create a named local trigger"),
-        BotCommand("pairing", "Manage DM pairing (approve/deny/list)"),
-        BotCommand("model", "Switch runtime model preset"),
-        BotCommand("skill", "List enabled skills"),
-        BotCommand("dream", "Run Dream memory consolidation now"),
-        BotCommand("dream_log", "Show the latest Dream memory change"),
-        BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
-        BotCommand("dream_prompt", "Tell Dream how to organize memory"),
-        BotCommand("help", "Show available commands"),
+        *(
+            BotCommand(spec.command.lstrip("/").replace("-", "_"), spec.title)
+            for spec in BUILTIN_COMMAND_SPECS
+        ),
     ]
-
-    # Regex for slash commands routed to AgentLoop via ``_forward_command``.
-    # Hyphenated ``dream-*`` commands stay on a separate handler (below).
-    TELEGRAM_BUS_SLASH_COMMAND_RE = re.compile(
-        r"^/(?:new|stop|restart|status|dream|history|trigger|pairing|model|skill)(?:@\w+)?(?:\s+.*)?$"
-    )
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
@@ -501,18 +496,30 @@ class TelegramChannel(BaseChannel):
 
         return sid in allow_list or username in allow_list
 
-    @staticmethod
-    def _normalize_telegram_command(content: str) -> str:
+    #: Underscore spelling to canonical atom command, for every hyphenated command.
+    #:
+    #: Telegram's menu only accepts ``[a-z0-9_]`` in a command name, so a user who
+    #: taps ``/dream_log`` must reach ``/dream-log``. Derived from the spec list for
+    #: the same reason as :data:`BOT_COMMANDS`: the previous version handled the
+    #: three ``dream_*`` commands by name, so ``/evaluator_prompt`` — advertised in
+    #: the menu once that list was derived — would have arrived unmapped and been
+    #: rejected as unknown.
+    TELEGRAM_COMMAND_ALIASES: dict[str, str] = {
+        spec.command.replace("-", "_"): spec.command
+        for spec in BUILTIN_COMMAND_SPECS
+        if "-" in spec.command
+    }
+
+    @classmethod
+    def _normalize_telegram_command(cls, content: str) -> str:
         """Map Telegram-safe command aliases back to canonical atom commands."""
         if not content.startswith("/"):
             return content
-        if content == "/dream_log" or content.startswith("/dream_log "):
-            return content.replace("/dream_log", "/dream-log", 1)
-        if content == "/dream_restore" or content.startswith("/dream_restore "):
-            return content.replace("/dream_restore", "/dream-restore", 1)
-        if content == "/dream_prompt" or content.startswith("/dream_prompt "):
-            return content.replace("/dream_prompt", "/dream-prompt", 1)
-        return content
+        head, sep, rest = content.partition(" ")
+        canonical = cls.TELEGRAM_COMMAND_ALIASES.get(head)
+        if canonical is None:
+            return content
+        return f"{canonical}{sep}{rest}"
 
     async def start(self) -> None:
         """Start the Telegram bot."""
@@ -549,22 +556,21 @@ class TelegramChannel(BaseChannel):
         self._app.add_error_handler(self._on_error)
 
         # Add command handlers (using Regex to support @username suffixes before bot initialization)
+        # `/start` and `/help` are answered by the channel itself, so they are
+        # registered before the catch-all below and win the match.
         self._app.add_handler(MessageHandler(filters.Regex(r"^/start(?:@\w+)?$"), self._on_start))
-        self._app.add_handler(
-            MessageHandler(
-                filters.Regex(TelegramChannel.TELEGRAM_BUS_SLASH_COMMAND_RE),
-                self._forward_command,
-            )
-        )
-        self._app.add_handler(
-            MessageHandler(
-                filters.Regex(
-                    r"^/(dream-log|dream_log|dream-restore|dream_restore|dream-prompt|dream_prompt)(?:@\w+)?(?:\s+.*)?$"
-                ),
-                self._forward_command,
-            )
-        )
         self._app.add_handler(MessageHandler(filters.Regex(r"^/help(?:@\w+)?$"), self._on_help))
+
+        # Every other slash command goes to the bus. Deliberately a catch-all
+        # rather than an allowlist of names: the allowlist it replaced had to be
+        # edited for each new command, was missed three times (`/mask`,
+        # `/secrets`, `/evaluator-prompt`), and the failure was silent — the
+        # general handler below excludes `filters.COMMAND`, so an unlisted command
+        # matched nothing at all and the user got no reply. The router already
+        # rejects commands it does not recognize, and `_process_forward_command`
+        # enforces the sender allowlist, so forwarding everything is both safer
+        # and less code than keeping two lists in sync.
+        self._app.add_handler(MessageHandler(filters.COMMAND, self._forward_command))
 
         # Add message handler for text, photos, video, voice, documents, and locations
         self._app.add_handler(

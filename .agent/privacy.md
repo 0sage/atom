@@ -737,6 +737,37 @@ on refusal, and every path that saw a value sets `carried_value` so the channel
 deletes the user's message. `/mask` with no arguments lists types and lengths, never
 values: printing them would put every masked name back into the chat at once.
 
+### Registering a command in the router is not enough to make it reachable
+
+`/mask` was routed, tested, listed by `/help` — and silently unreachable from
+Telegram for its first three releases. Typing `/mask iban …` produced no reply at
+all.
+
+The channel registered an *allowlist regex of command names*
+(`TELEGRAM_BUS_SLASH_COMMAND_RE`) and forwarded only what matched, while the
+general message handler excludes `filters.COMMAND`. So an unlisted slash command
+matched no handler whatsoever: not forwarded, not rejected, not logged. `/secrets`
+and `/evaluator-prompt` had the same defect — three commands missed on a list that
+had to be hand-edited for each addition.
+
+Two things made it survive review. The suite pinned the allowlist's *contents*
+(asserting `/history` and `/model` matched), which cannot detect an absent entry.
+And the failure mode is silence, which reads exactly like a message that was never
+sent. Neither `/help` nor the router disagreed — both knew about `/mask`.
+
+The fix removes the allowlist rather than extending it: `filters.COMMAND` forwards
+everything, and the router already rejects what it does not recognize. `BOT_COMMANDS`
+and the underscore aliases are now derived from `BUILTIN_COMMAND_SPECS`, so a new
+command cannot be added to atom and forgotten in the channel. Authorization is
+unaffected — `_process_forward_command` enforces the sender allowlist before
+anything is forwarded, and the group mention policy still applies only to
+non-command messages, as it always did for `/new` and `/stop`.
+
+The generalizable rule: **when a channel decides what to forward by naming
+commands, the list is a second registry that will drift.** Derive it, or make the
+default case forward. And test the derivation, not its output — a test that
+enumerates what a list contains cannot fail when something is missing from it.
+
 ## Modules
 
 | File | Owns |

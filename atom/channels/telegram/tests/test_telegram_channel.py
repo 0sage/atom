@@ -1,4 +1,5 @@
 import asyncio
+import re
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from atom.channels.telegram.runtime import (
     _split_telegram_markdown,
     _StreamBuf,
 )
+from atom.command.builtin import BUILTIN_COMMAND_SPECS
 
 
 class _FakeHTTPXRequest:
@@ -1751,22 +1753,53 @@ async def test_forward_command_normalizes_telegram_safe_dream_aliases() -> None:
     assert handled[0]["content"] == "/dream-prompt init"
 
 
-def test_telegram_bus_slash_command_regex_matches_agent_loop_commands() -> None:
-    """Bus-routed slash commands must match the Telegram handler regex (see builtin router)."""
-    pat = TelegramChannel.TELEGRAM_BUS_SLASH_COMMAND_RE
-    assert pat.fullmatch("/history")
-    assert pat.fullmatch("/history 5")
-    assert pat.fullmatch("/trigger")
-    assert pat.fullmatch("/trigger PR review")
-    assert pat.fullmatch("/pairing list")
-    assert pat.fullmatch("/model fast")
-    assert pat.fullmatch("/skill")
-    assert pat.fullmatch("/skill@atom_bot")
-    assert pat.fullmatch("/new@atom_bot")
-    assert pat.fullmatch("/trigger@atom_bot CI summary")
-    assert pat.fullmatch("/dream-log deadbeef") is None
-    assert pat.fullmatch("/dream-restore deadbeef") is None
-    assert pat.fullmatch("/dream-prompt init") is None
+class TestEveryCommandReachesTheBus:
+    """No registered command may be silently dropped by the Telegram channel.
+
+    This replaced a test that pinned an allowlist regex of command names. The
+    allowlist was the bug: it had to be edited for every new command, was missed
+    three times (``/mask``, ``/secrets``, ``/evaluator-prompt``), and failed
+    *silently* — the general message handler excludes ``filters.COMMAND``, so an
+    unlisted command matched no handler at all and the user got no reply. Pinning
+    the allowlist's contents could never have caught that; pinning the derivation
+    can.
+    """
+
+    def test_the_menu_covers_every_registered_command(self) -> None:
+        offered = {c.command for c in TelegramChannel.BOT_COMMANDS}
+        for spec in BUILTIN_COMMAND_SPECS:
+            telegram_name = spec.command.lstrip("/").replace("-", "_")
+            assert telegram_name in offered, spec.command
+
+    def test_the_commands_that_carry_secrets_are_offered(self) -> None:
+        """The two that went missing longest, named so a regression is obvious."""
+        offered = {c.command for c in TelegramChannel.BOT_COMMANDS}
+        assert "mask" in offered
+        assert "secrets" in offered
+
+    def test_every_offered_name_is_legal_for_telegram(self) -> None:
+        """Telegram rejects the whole `setMyCommands` call, not the bad entry."""
+        for command in TelegramChannel.BOT_COMMANDS:
+            name = command.command
+            assert re.fullmatch(r"[a-z0-9_]{1,32}", name), name
+
+    def test_every_hyphenated_command_has_an_underscore_alias(self) -> None:
+        """A menu entry Telegram can show must map back to what the router knows."""
+        for spec in BUILTIN_COMMAND_SPECS:
+            if "-" not in spec.command:
+                continue
+            offered = spec.command.replace("-", "_")
+            assert TelegramChannel._normalize_telegram_command(offered) == spec.command
+
+    def test_an_alias_keeps_its_arguments(self) -> None:
+        assert (
+            TelegramChannel._normalize_telegram_command("/evaluator_prompt be terse")
+            == "/evaluator-prompt be terse"
+        )
+
+    def test_a_canonical_command_is_left_alone(self) -> None:
+        for text in ("/mask iban GB82WEST123456", "/status", "/dream-log", "hello"):
+            assert TelegramChannel._normalize_telegram_command(text) == text
 
 
 @pytest.mark.asyncio
