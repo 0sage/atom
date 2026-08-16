@@ -99,11 +99,28 @@ MAX_ENTRIES = 10_000
 #: to prevent. Data is lost rather than leaked, and the loss is logged.
 CAPPED_PLACEHOLDER = "«email:capped»"
 
+#: Characters legal in a local part. Named so the pattern and its guard cannot
+#: drift apart: the guard's job is to be exactly this set.
+_LOCAL_PART_CHARS = r"A-Za-z0-9!#$%&'*+/=?^_`{|}~.-"
+
 #: Deliberately loose on the local part and strict on the shape: a value that
 #: does not look like an address must not be replaced, since a wrong
 #: substitution corrupts text the agent then reasons over.
+#:
+#: The lookbehind is a performance guard, not part of the address grammar. A
+#: match can only begin where the preceding character could not itself have been
+#: part of the local part, which is true of every real address — one is preceded
+#: by a space, a quote, a bracket or the start of the text. Without it, a run of
+#: *n* local-part characters not followed by a valid domain is retried from all
+#: *n* offsets, each failing only after scanning ahead to the ``@``: quadratic in
+#: the length of the run. Tool output makes that reachable, since base64 blobs
+#: and hex dumps are made of local-part-legal characters, and a single ``@``
+#: anywhere past one is enough to defeat the cheap ``"@" not in text`` exit. A
+#: 24KB blob cost ~340ms before this and ~0.2ms after, with no change to what
+#: matches (verified against the unguarded pattern over 400k fuzzed strings).
 _EMAIL_RE = re.compile(
-    r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    rf"(?<![{_LOCAL_PART_CHARS}])[{_LOCAL_PART_CHARS}]+"
+    r"@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+"
 )
 
@@ -395,6 +412,17 @@ class TokenStore:
         with self._lock:
             return len(self._load())
 
+    def __bool__(self) -> bool:
+        """Always true, so a store is never mistaken for "no store".
+
+        Without this, ``__len__`` makes an empty store falsy and the idiomatic
+        ``store or DEFAULT_TOKEN_STORE`` silently swaps a caller's store for the
+        default one during precisely the window it is empty. That sent values
+        into the real map and is the kind of bug a reader of the call site cannot
+        see, so the trap is closed here rather than only at the two call sites.
+        """
+        return True
+
 
 DEFAULT_TOKEN_STORE = TokenStore()
 
@@ -408,7 +436,11 @@ def tokenize(text: str, store: TokenStore | None = None) -> str:
     """
     if not text or "@" not in text:
         return text
-    resolved = store or DEFAULT_TOKEN_STORE
+    # `store or DEFAULT_TOKEN_STORE` was wrong: __len__ makes an empty store
+    # falsy, so an explicitly passed store was discarded for exactly as long as
+    # it was empty — its whole first-use window. Values then went to the default
+    # map instead, which is the user's real one.
+    resolved = store if store is not None else DEFAULT_TOKEN_STORE
 
     def _replace(match: re.Match[str]) -> str:
         raw = match.group(0)
@@ -431,7 +463,10 @@ def detokenize(text: str, store: TokenStore | None = None) -> str:
     """
     if not text or "«" not in text:
         return text
-    resolved = store or DEFAULT_TOKEN_STORE
+    # `is not None` rather than `or`: see the note in tokenize(). An empty store
+    # is falsy, and silently resolving against the default map would show one
+    # caller's values to another.
+    resolved = store if store is not None else DEFAULT_TOKEN_STORE
 
     def _replace(match: re.Match[str]) -> str:
         return resolved.value_for(match.group(0)) or match.group(0)

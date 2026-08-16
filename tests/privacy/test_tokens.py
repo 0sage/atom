@@ -338,3 +338,134 @@ class TestNoPlaintextLeftBehind:
         tokenize("alex@example.com")
         assert "alex@example.com" in store.path.read_text()
         assert len(store) == 1
+
+
+class TestExplicitStoreIsAlwaysHonoured:
+    """An explicitly passed store must never be swapped for the default one.
+
+    ``__len__`` makes an empty store falsy, so the idiomatic
+    ``store or DEFAULT_TOKEN_STORE`` discarded the caller's store for exactly as
+    long as it was empty — its whole first-use window — and wrote to the real
+    map at ``~/.atom/private/tokens.json`` instead. Found by a benchmark whose
+    isolated stores stayed empty while the user's map filled to ``MAX_ENTRIES``.
+    """
+
+    def test_empty_store_is_truthy(self, tmp_path) -> None:
+        assert bool(TokenStore(path=tmp_path / "t.json")) is True
+
+    def test_tokenize_writes_to_the_given_empty_store(self, tmp_path, monkeypatch) -> None:
+        default = TokenStore(path=tmp_path / "default.json")
+        monkeypatch.setattr(tokens_module, "DEFAULT_TOKEN_STORE", default)
+        explicit = TokenStore(path=tmp_path / "explicit.json")
+
+        out = tokenize("mail alex@example.com", store=explicit)
+
+        assert "«email:" in out
+        assert len(explicit) == 1
+        assert len(default) == 0
+        assert not default.path.exists()
+
+    def test_detokenize_reads_from_the_given_empty_store(self, tmp_path, monkeypatch) -> None:
+        """A default map holding the same token must not answer for another store."""
+        default = TokenStore(path=tmp_path / "default.json")
+        monkeypatch.setattr(tokens_module, "DEFAULT_TOKEN_STORE", default)
+        explicit = TokenStore(path=tmp_path / "explicit.json")
+        token = tokenize("alex@example.com", store=explicit).strip()
+        default_token = tokenize("someone.else@example.org", store=default)
+
+        assert detokenize(token, store=explicit) == "alex@example.com"
+        # The default store is non-empty now, so a truthiness fallback would look
+        # correct here; what it must not do is answer for `explicit`.
+        assert detokenize(default_token, store=explicit) == default_token
+
+    def test_first_and_later_calls_use_the_same_store(self, tmp_path, monkeypatch) -> None:
+        """The bug only showed on the first call, while the store was empty."""
+        default = TokenStore(path=tmp_path / "default.json")
+        monkeypatch.setattr(tokens_module, "DEFAULT_TOKEN_STORE", default)
+        explicit = TokenStore(path=tmp_path / "explicit.json")
+
+        tokenize("first@example.com", store=explicit)
+        tokenize("second@example.com", store=explicit)
+
+        assert len(explicit) == 2
+        assert len(default) == 0
+
+
+class TestPathologicalInputStaysLinear:
+    """Bulk tool output must not be able to stall the engine.
+
+    ``_EMAIL_RE`` carries a lookbehind so a long run of local-part-legal
+    characters is tried from one offset instead of every offset. Without it the
+    cost is quadratic in the length of the run, and tool output reaches that
+    easily: base64 blobs and hex dumps are made of local-part-legal characters,
+    and one ``@`` anywhere past such a run defeats the cheap ``"@" not in text``
+    exit. Measured before the guard: ~340ms for 24KB, ~1s for 40KB.
+
+    Timing is asserted only as a ceiling generous enough for the slowest rung in
+    ``scripts/bench_privacy.py``'s ladder (flash storage on ARM). The scaling
+    assertion is the real test: quadratic growth fails it on any hardware.
+    """
+
+    #: Local-part-legal, so every offset in a run of these is a candidate start.
+    BLOB = "QUJDREVG+/=."
+
+    def test_long_run_without_a_domain_is_not_quadratic(self, store: TokenStore) -> None:
+        import time
+
+        def cost_ms(chars: int) -> float:
+            text = self.BLOB * (chars // len(self.BLOB)) + "@ "
+            start = time.perf_counter_ns()
+            tokenize(text, store=store)
+            return (time.perf_counter_ns() - start) / 1e6
+
+        cost_ms(2_000)  # discard: first call pays for lazily compiled internals
+        small = cost_ms(5_000)
+        large = cost_ms(20_000)
+        # Quadratic would be ~16x for 4x the input. Linear is ~4x. The bound sits
+        # between them with room for timer noise on a loaded CI host.
+        assert large < max(small, 0.05) * 10
+
+    def test_pathological_shapes_finish_promptly(self, store: TokenStore) -> None:
+        import time
+
+        shapes = {
+            "blob_then_at": self.BLOB * 2_000 + "@ ",
+            "long_local_no_domain": "a" * 20_000 + "@ ",
+            "hex_dump_then_at": "deadbeef" * 3_000 + "@ ",
+            "at_without_domain_repeated": "user@ " * 4_000,
+            "run_with_at_every_100": ("a" * 100 + "@") * 200,
+        }
+        for name, text in shapes.items():
+            start = time.perf_counter_ns()
+            tokenize(text, store=store)
+            elapsed_ms = (time.perf_counter_ns() - start) / 1e6
+            assert elapsed_ms < 100, f"{name} took {elapsed_ms:.1f}ms"
+
+    def test_no_address_was_stored_for_any_of_them(self, store: TokenStore) -> None:
+        """The shapes above are near-misses: none is an address worth a token."""
+        tokenize(self.BLOB * 100 + "@ ", store=store)
+        tokenize("a" * 1_000 + "@ ", store=store)
+        assert len(store) == 0
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "mailto:alex@example.com",
+            "<alex@example.com>",
+            '"alex@example.com"',
+            "(alex@example.com)",
+            "alex@example.com",
+            "to:alex@example.com,bob@example.org",
+            "[alex@example.com]",
+            "send\talex@example.com\tnow",
+        ],
+    )
+    def test_the_guard_does_not_hide_a_real_address(
+        self, store: TokenStore, text: str
+    ) -> None:
+        """Every real address is preceded by something not in a local part.
+
+        The lookbehind is a performance guard, so it must not narrow what
+        matches. These are the delimiters an address actually arrives behind.
+        """
+        assert "@example." not in tokenize(text, store=store)

@@ -326,6 +326,80 @@ A corrupt map disables minting for the process rather than being overwritten: th
 file may be recoverable by hand, and rewriting it would strand every token
 already in saved history as an unresolvable placeholder.
 
+### An explicit store must be compared with `is not None`, never truthiness
+
+`TokenStore.__len__` exists, so an empty store is falsy, and the idiomatic
+`store or DEFAULT_TOKEN_STORE` silently swapped a caller's store for the default
+one for exactly as long as it was empty — the whole first-use window. Values went
+into the operator's real `~/.atom/private/tokens.json` instead.
+
+`__bool__` now returns `True` unconditionally, so the trap is closed at the class
+rather than only at the two call sites; both sites also use `is not None`.
+
+Found by `scripts/bench_privacy.py`, not by the suite: `conftest.py` redirects
+`DEFAULT_TOKEN_STORE` for every test, so a test that *did* leak wrote to the
+redirected map and passed. 4473 tests were green while the bug filled the real
+map to `MAX_ENTRIES` with 9,948 synthetic addresses, which also capped real
+tokenization. Anything that constructs a `TokenStore` outside pytest is on the
+path the suite cannot see.
+
+### The cold path is quadratic, and that is the open defect
+
+`_save` reserializes the entire map on every new value, so minting *n* addresses
+writes O(n²) bytes. Measured on APFS/NVMe — the fastest rung of the ladder:
+
+| New addresses | Time | Bytes written | Final file | Amplification |
+| --- | --- | --- | --- | --- |
+| 100 | 34 ms | — | 20 KB | — |
+| 800 | 926 ms | 65 MB | 160 KB | 401× |
+| 1600 | 3.3 s | — | 320 KB | — |
+| 10,000 (extrapolated) | ~130 s | — | 2 MB | — |
+
+Doubling the input costs ~3.6×, so it is quadratic rather than linear.
+
+**The cost is serialization, not durability.** `json.dumps` with `indent=2` over
+the whole map accounts for ~99% of `_save`; the two `fsync` calls are 4%. That
+contradicts the obvious guess — the first prediction when this was investigated
+was that fsync would dominate, and it does not, on any rung measured so far.
+
+Consequences, in the order they matter:
+
+- A bulk tool result carrying thousands of new addresses stalls the turn. At the
+  cap it is ~130 s on the fastest hardware supported.
+- Throughput is ~810 new addresses/second against ~1.2M already-mapped ones —
+  three orders of magnitude apart for the same call.
+- `MAX_ENTRIES` is what keeps this bounded rather than unbounded, which is a
+  second reason the cap exists beyond the disclosure argument above.
+
+Not fixed here, because the fix is a storage-format change and this was found
+while building the benchmark. The options, cheapest first: batch one save per
+`tokenize` call rather than per value; drop `indent=2` on write; append new
+entries to a journal and compact periodically. The first is enough for the tool
+result case, which is the one that hurts.
+
+`tests/privacy/test_perf_budget.py` pins the *shape* (per-mint cost rises with
+map size) rather than a duration, so it documents the defect and notices if it is
+fixed.
+
+### `_EMAIL_RE` needs its lookbehind to stay linear
+
+The local-part character class contains `.`, `-`, `+` and more, so a run of *n*
+local-part-legal characters offers *n* candidate start offsets, each failing only
+after scanning ahead to the `@`: quadratic in the run length. Tool output reaches
+this trivially — base64 blobs and hex dumps are made of local-part-legal
+characters, and one `@` anywhere past such a run defeats the cheap
+`"@" not in text` exit.
+
+Measured before the fix: 24 KB blob 343 ms, 40 KB 1.02 s. A `(?<![local])` guard
+makes a match start only where the previous character could not have been part of
+the local part — true of every real address, which is preceded by a space, quote,
+bracket, or start of text. Same shape after the guard: 0.22 ms, a 1542×
+improvement, with identical match results across 400k fuzzed strings and 29
+targeted shapes.
+
+The domain side has a nested quantifier that *looks* worse and is not: it is
+anchored by literal dots, and measured linear.
+
 ### The map is capped, and the cap loses data rather than leaking it
 
 `MAX_ENTRIES = 10_000`. Tool output is the reason: one `grep -r "@"` over a mail
