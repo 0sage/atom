@@ -534,14 +534,107 @@ gets resolved. The progress case was found live: a tool-hint line showed
 `echo 'contact is «email:ed07eada»'` while the reply beside it showed the
 address.
 
+## What is implemented: declared masks
+
+`/mask name Alexey` registers a literal value as personal data. From then on it is
+replaced with `«name:a1b2c3d4»` everywhere tokenization runs — message text, tool
+output, subagent results, transcription — and resolved back on the way out to the
+user, exactly like an address.
+
+### Declared, not discovered — and the distinction is the design
+
+An address is found by `_EMAIL_RE` whether or not anyone registered it. There is
+no equivalent pattern for a person's name: attempting one is NER by regex, and it
+would rewrite ordinary words forever. **The command is the detection.** Nothing is
+inferred, which is why `/mask` requires the operator to say what the value is.
+
+Consequence worth stating plainly: a mask only applies *after* it is registered.
+Text already in session history keeps the plaintext. Retroactive masking would
+mean rewriting saved history, which is a much larger decision and was not taken.
+
+### Typed, not one generic `text`
+
+`TYPE_NAME`, `TYPE_SURNAME`, `TYPE_ADDRESS`, `TYPE_PHONE`, `TYPE_COMPANY`, plus
+`TYPE_TEXT` as an escape hatch for a value that fits nothing else.
+
+The type is the only thing the model sees. `«text:a1b2c3d4» sent an invoice to
+«text:99887766»` leaves it unable to tell a person from a company, so it cannot
+choose "they" over "it" or write grammatical prose around the placeholder — and
+`_TOKEN_GUIDANCE` exists precisely because it misbehaves when it cannot tell. A
+line naming each type and its meaning is appended to that guidance for the same
+reason: a label the model has no explanation for is a label it ignores.
+
+Resolution is type-agnostic (`_TOKEN_RE` matches `[a-z]+`), so the label costs
+nothing structurally. Two constraints follow from that regex, both verified: a type
+must be a single lowercase word — `first_name`, `firstName` and `given-name` are
+**not resolvable** — and renaming a type means migrating live data, since it is
+written to disk inside every placeholder. `TYPE_TEXT` is deliberately *alongside*
+the specific types rather than a default; as a default it would quietly become the
+common case and give back the ambiguity the specific types remove.
+
+`MASK_TYPES` is a closed set, not a free-form field, so `/mask nmae` is refused
+rather than minting a type nothing has guidance for.
+
+### The hazard is corrupting text, not performance
+
+A wrong substitution is worse than no substitution: the agent reasons over what
+comes back. Three rules, each from a measured failure:
+
+- **`\b` on both ends.** Without it, masking `Sage` turns `Sagebrush` into
+  `«name:…»brush`.
+- **`MIN_MASK_LENGTH = 4`.** Masking `An` rewrites "an update" and `Read` rewrites
+  "please read" — both matched ordinary prose twice in a single test sentence.
+  This is the one rule an operator will hit and dislike, and it is not negotiable
+  for exactly that reason.
+- **Longest value first.** With `Sage` and `Sage Smith` both registered, matching
+  in insertion order yields `«name:…» Smith` and the surname survives in
+  plaintext.
+
+Also refused: a value with no letter or digit (nothing for `\b` to anchor to) and
+one containing guillemets (they delimit placeholders).
+
+Case is folded, so `alexey`, `Alexey` and `ALEXEY` share one token — the same
+choice `canonical_email` makes, and for the same reason: two tokens for one person
+is the worse error. Resolution shows the *registered* spelling back, which is
+deliberately lossy on display.
+
+### Cost is flat in the size of the registry
+
+One alternation over every declared literal, cached against the mask set so a
+`/mask` mid-session takes effect on the next message without recompiling per call.
+Measured over 35KB of clean text: 0.23ms for 1 mask, 0.23ms for 100, 0.26ms for
+1000 — the engine prefilters the alternation. An operator who never runs `/mask`
+pays one attribute lookup, since `mask_pattern()` returns `None`.
+
+This satisfies the marker-gate rule above: the gate is the alternation's own
+prefilter. `bench_privacy` covers it with `mask_registry_{1,100,1000}` and
+`mask_hits_100`.
+
+### Removal strands existing placeholders, and says so
+
+`/mask del <value>` deletes the entry. Every placeholder for it already written
+into saved history stops resolving. That is the honest outcome — the alternative
+is keeping the plaintext on disk after an operator asked for it to be forgotten —
+and the reply states it rather than reporting plain success.
+
+### The command surface follows `/secrets`
+
+Priority tier, both spellings (`/mask`, `/masks`), because the arguments carry the
+value in plaintext and that tier is the path which persists nothing to session
+history and sends nothing to the model. Replies never quote the value, including
+on refusal, and every path that saw a value sets `carried_value` so the channel
+deletes the user's message. `/mask` with no arguments lists types and lengths, never
+values: printing them would put every masked name back into the chat at once.
+
 ## Modules
 
 | File | Owns |
 | --- | --- |
 | `store.py` | `secrets.env` — validation, parsing, atomic writes |
 | `commands.py` | `/secrets` reply text and the delete-source request |
+| `mask_commands.py` | `/mask` reply text, listing, and the delete-source request |
 | `env.py` | injection into `ExecTool._build_env` |
-| `tokens.py` | `tokens.json` — minting, both-direction lookup, `tokenize`/`detokenize` |
+| `tokens.py` | `tokens.json` — minting, both-direction lookup, `tokenize`/`detokenize`, the mask registry |
 | `hooks.py` | the ingress boundaries and the model-facing guidance block |
 | `stream.py` | placeholder resolution across stream-delta boundaries |
 

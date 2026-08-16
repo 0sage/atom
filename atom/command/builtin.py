@@ -174,6 +174,14 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
         "[set NAME=value|del NAME]",
         accepts_args=True,
     ),
+    BuiltinCommandSpec(
+        "/mask",
+        "Mask personal data",
+        "Replace a name, address or other value with a placeholder everywhere.",
+        "user-round",
+        "[TYPE value|del value]",
+        accepts_args=True,
+    ),
 )
 
 
@@ -905,6 +913,29 @@ async def cmd_secrets(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_mask(ctx: CommandContext) -> OutboundMessage:
+    """Declare a value as personal data, or stop masking one.
+
+    Registered on the priority tier for the same reason as ``/secrets``: the
+    arguments carry the value in plaintext, and the priority tier is the path that
+    persists nothing to session history and sends nothing to the model.
+    """
+    from atom.privacy.mask_commands import handle_mask_command
+
+    reply = handle_mask_command(ctx.args)
+    metadata: dict[str, Any] = {**dict(ctx.msg.metadata or {}), "render_as": "text"}
+    if reply.carried_value:
+        # The value sits in the user's chat history until the channel deletes it.
+        # Best-effort, so the reply never claims the deletion succeeded.
+        metadata[OUTBOUND_META_DELETE_SOURCE] = True
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=reply.text,
+        metadata=metadata,
+    )
+
+
 async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
     """List all enabled skills (name and description only)."""
     loop = ctx.loop
@@ -1027,3 +1058,10 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/secret", cmd_secrets)
     router.priority_prefix("/secrets ", cmd_secrets)
     router.priority_prefix("/secret ", cmd_secrets)
+    # Same tier, same reason: the arguments carry the value being masked, so
+    # dispatch must not persist them. Both spellings, since the plural is the
+    # natural typo for a command that takes one value.
+    router.priority("/mask", cmd_mask)
+    router.priority("/masks", cmd_mask)
+    router.priority_prefix("/mask ", cmd_mask)
+    router.priority_prefix("/masks ", cmd_mask)

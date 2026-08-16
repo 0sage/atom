@@ -10,13 +10,21 @@ import pytest
 
 from atom.privacy import tokens as tokens_module
 from atom.privacy.tokens import (
+    MASK_TYPES,
     SCHEMA_VERSION,
+    TYPE_COMPANY,
     TYPE_EMAIL,
+    TYPE_NAME,
+    TYPE_SURNAME,
+    TYPE_TEXT,
     UNKNOWN_TIMESTAMP,
+    MaskError,
     TokenStore,
     canonical_email,
     detokenize,
+    placeholder,
     tokenize,
+    validate_mask,
 )
 
 
@@ -642,3 +650,215 @@ class TestPathologicalInputStaysLinear:
         matches. These are the delimiters an address actually arrives behind.
         """
         assert "@example." not in tokenize(text, store=store)
+
+
+class TestDeclaredMasks:
+    """Values an operator declares with ``/mask``, rather than ones a pattern finds.
+
+    There is no reliable regex for a person's name, so the command is the
+    detection. The type is carried anyway because it is the only thing the model
+    sees: ``«text:…» sent an invoice to «text:…»`` leaves it unable to tell a
+    person from a company, so it cannot pick correct pronouns or grammar.
+    """
+
+    def test_a_declared_value_is_replaced(self, store: TokenStore) -> None:
+        store.add_mask(TYPE_NAME, "Alexey")
+        out = tokenize("Alexey called", store=store)
+        assert "Alexey" not in out
+        assert out.startswith("«name:")
+
+    def test_the_type_appears_in_the_placeholder(self, store: TokenStore) -> None:
+        store.add_mask(TYPE_SURNAME, "Petrov")
+        assert "«surname:" in tokenize("Petrov called", store=store)
+
+    def test_round_trip_restores_the_registered_spelling(self, store: TokenStore) -> None:
+        store.add_mask(TYPE_NAME, "Alexey")
+        assert detokenize(tokenize("Alexey called", store=store), store=store) == (
+            "Alexey called"
+        )
+
+    def test_declaring_twice_is_idempotent(self, store: TokenStore) -> None:
+        """Two tokens for one person is the error worth preventing."""
+        first = store.add_mask(TYPE_NAME, "Alexey")
+        assert store.add_mask(TYPE_NAME, "Alexey") == first
+        assert len(store) == 1
+
+    def test_case_variants_share_one_token(self, store: TokenStore) -> None:
+        store.add_mask(TYPE_NAME, "Alexey")
+        out = tokenize("ALEXEY and alexey and Alexey", store=store)
+        assert len({part for part in out.split() if part.startswith("«")}) == 1
+
+    def test_resolution_uses_the_registered_casing(self, store: TokenStore) -> None:
+        """Deliberately lossy on display, the same trade `canonical_email` makes."""
+        store.add_mask(TYPE_NAME, "Alexey")
+        assert detokenize(tokenize("ALEXEY called", store=store), store=store) == (
+            "Alexey called"
+        )
+
+    def test_masks_and_addresses_coexist(self, store: TokenStore) -> None:
+        store.add_mask(TYPE_NAME, "Alexey")
+        out = tokenize("Alexey at alexey@example.com", store=store)
+        assert "«name:" in out
+        assert "«email:" in out
+        assert "alexey@example.com" not in out
+
+    def test_a_mask_inside_an_address_does_not_split_it(self, store: TokenStore) -> None:
+        """Addresses are substituted first, and `\\b` cannot match inside a token."""
+        store.add_mask(TYPE_NAME, "alexey")
+        out = tokenize("write to alexey@example.com", store=store)
+        assert out.count("«") == 1
+        assert "«email:" in out
+
+    def test_removing_a_mask_stops_new_substitutions(self, store: TokenStore) -> None:
+        store.add_mask(TYPE_NAME, "Alexey")
+        store.remove_mask("Alexey")
+        assert tokenize("Alexey called", store=store) == "Alexey called"
+
+    def test_removing_a_mask_strands_tokens_already_written(self, store: TokenStore) -> None:
+        """The honest outcome: the alternative is keeping plaintext after a delete."""
+        token = tokenize("Alexey called", store=store)  # nothing declared yet
+        store.add_mask(TYPE_NAME, "Alexey")
+        token = tokenize("Alexey called", store=store).split()[0]
+        store.remove_mask("Alexey")
+        assert detokenize(token, store=store) == token
+
+    def test_removing_an_unknown_value_is_not_an_error(self, store: TokenStore) -> None:
+        assert store.remove_mask("never registered") is None
+
+    def test_masks_listing_excludes_addresses(self, store: TokenStore) -> None:
+        """Addresses are discovered, not declared, so they are not masks."""
+        tokenize("alex@example.com", store=store)
+        store.add_mask(TYPE_NAME, "Alexey")
+        assert [entry[1] for entry in store.masks()] == [TYPE_NAME]
+
+    def test_a_mask_added_mid_session_takes_effect(self, store: TokenStore) -> None:
+        """The compiled alternation is cached, so this pins that it invalidates."""
+        assert tokenize("Alexey called", store=store) == "Alexey called"
+        store.add_mask(TYPE_NAME, "Alexey")
+        assert "«name:" in tokenize("Alexey called", store=store)
+
+    def test_no_masks_means_no_scanning_cost(self, store: TokenStore) -> None:
+        assert store.mask_pattern() is None
+        assert tokenize("ordinary text with no at sign", store=store) == (
+            "ordinary text with no at sign"
+        )
+
+
+class TestMasksDoNotCorruptText:
+    """A wrong substitution is worse than no substitution.
+
+    The agent reasons over what comes back, so a mask that rewrites part of an
+    ordinary word turns its input into nonsense. These are the shapes that
+    caught it during development.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Alexeyevich arrived",  # mask is a prefix of a longer word
+            "myAlexey",  # mask is a suffix
+            "xAlexeyx",  # mask is interior
+        ],
+    )
+    def test_a_mask_does_not_match_inside_a_longer_word(
+        self, store: TokenStore, text: str
+    ) -> None:
+        store.add_mask(TYPE_NAME, "Alexey")
+        assert tokenize(text, store=store) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Alexey's laptop",
+            "(Alexey)",
+            '"Alexey" said',
+            "Alexey, then",
+            "Alexey-Petrov",
+            "call Alexey.",
+        ],
+    )
+    def test_a_mask_matches_around_punctuation(
+        self, store: TokenStore, text: str
+    ) -> None:
+        """Boundaries must not be so strict that real occurrences are missed."""
+        store.add_mask(TYPE_NAME, "Alexey")
+        assert "Alexey" not in tokenize(text, store=store)
+
+    def test_the_longer_of_two_overlapping_masks_wins(self, store: TokenStore) -> None:
+        """Otherwise the surname survives in plaintext beside the masked name."""
+        store.add_mask(TYPE_NAME, "Sage")
+        store.add_mask(TYPE_SURNAME, "Sage Smith")
+        out = tokenize("Sage Smith called", store=store)
+        assert "Smith" not in out
+        assert out.count("«") == 1
+
+    def test_a_multi_word_mask_matches(self, store: TokenStore) -> None:
+        store.add_mask(TYPE_COMPANY, "Acme Corp")
+        assert "Acme" not in tokenize("works at Acme Corp today", store=store)
+
+    def test_a_multi_word_mask_does_not_match_a_longer_name(
+        self, store: TokenStore
+    ) -> None:
+        store.add_mask(TYPE_COMPANY, "Acme Corp")
+        assert tokenize("Acme Corporation", store=store) == "Acme Corporation"
+
+    def test_internal_whitespace_is_normalized(self, store: TokenStore) -> None:
+        """"Acme   Corp" registered must still match "Acme Corp" as typed."""
+        entity_type, value = validate_mask(TYPE_COMPANY, "Acme   Corp")
+        store.add_mask(entity_type, value)
+        assert "Acme" not in tokenize("at Acme Corp now", store=store)
+
+
+class TestMaskValidation:
+    """Refusals that exist because the alternative corrupts text.
+
+    Messages name the rule and never quote the value: the reply travels back
+    through the channel the value arrived on.
+    """
+
+    def test_a_short_value_is_refused(self) -> None:
+        """Masking 'An' rewrites 'an update'; measured twice in one sentence."""
+        with pytest.raises(MaskError, match="Too short"):
+            validate_mask(TYPE_NAME, "An")
+
+    def test_the_minimum_length_is_inclusive(self) -> None:
+        assert validate_mask(TYPE_NAME, "Alex") == (TYPE_NAME, "Alex")
+
+    def test_an_unknown_type_is_refused(self) -> None:
+        with pytest.raises(MaskError, match="Unknown type"):
+            validate_mask("nmae", "Alexey")
+
+    def test_the_error_lists_the_known_types(self) -> None:
+        with pytest.raises(MaskError) as excinfo:
+            validate_mask("nmae", "Alexey")
+        for known in MASK_TYPES:
+            assert known in str(excinfo.value)
+
+    def test_an_empty_value_is_refused(self) -> None:
+        with pytest.raises(MaskError, match="Nothing to mask"):
+            validate_mask(TYPE_NAME, "   ")
+
+    def test_a_value_without_letters_or_digits_is_refused(self) -> None:
+        """`\\b` has nothing to anchor against, so matches land unpredictably."""
+        with pytest.raises(MaskError, match="letter or digit"):
+            validate_mask(TYPE_TEXT, "---!!!")
+
+    def test_guillemets_are_refused(self) -> None:
+        """They delimit placeholders, so a mask containing one is ambiguous."""
+        with pytest.raises(MaskError, match="Guillemets"):
+            validate_mask(TYPE_NAME, "«name:aaaaaaaa»")
+
+    def test_the_type_is_case_folded(self) -> None:
+        assert validate_mask("NAME", "Alexey")[0] == TYPE_NAME
+
+    def test_a_refusal_never_quotes_the_value(self) -> None:
+        secret = "Alexey"
+        with pytest.raises(MaskError) as excinfo:
+            validate_mask("nmae", secret)
+        assert secret not in str(excinfo.value)
+
+    def test_every_declared_type_is_resolvable(self) -> None:
+        """`_TOKEN_RE` accepts `[a-z]+`, so a type with an underscore would break."""
+        for entity_type in MASK_TYPES:
+            token = placeholder(entity_type, "a1b2c3d4")
+            assert tokens_module._TOKEN_RE.fullmatch(token), entity_type

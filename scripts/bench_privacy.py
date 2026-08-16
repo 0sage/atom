@@ -56,6 +56,7 @@ from atom.privacy.tokens import (  # noqa: E402
     MAX_ENTRIES,
     SCHEMA_VERSION,
     TYPE_EMAIL,
+    TYPE_NAME,
     TokenStore,
     detokenize,
     placeholder,
@@ -107,6 +108,11 @@ BUDGETS: dict[str, tuple[str, str, float]] = {
     # The ReDoS guard. Unguarded, these shapes cost 340ms-1s; the slowest rung
     # measures 3.9ms with the lookbehind in place.
     "regex_pathological": ("max_ms", "at_most", 100.0),
+    # A large mask registry must not make ordinary traffic slower. The literal
+    # alternation is prefiltered, so 1000 masks measured the same as 1 (~0.23ms
+    # over 35KB locally); the ceiling is set well above that to allow for flash
+    # and ARM without admitting linear growth in the registry size.
+    "mask_registry_1000": ("p95_ms", "at_most", 5.0),
 }
 
 
@@ -753,6 +759,80 @@ def case_stream_unclosed() -> CaseFn:
     return run
 
 
+def case_mask_registry(count: int) -> CaseFn:
+    """Cost of *count* declared masks against text none of them appear in.
+
+    The case the marker-gate rule is about. A mask is a literal, so the whole
+    registry becomes one alternation, and the question is whether registering more
+    of them makes ordinary traffic slower. Measured flat: the engine prefilters the
+    alternation, so 1000 literals cost what 1 does.
+
+    Text is deliberately mask-free and address-free, because that is what almost
+    every message and most tool output is.
+    """
+
+    def run(workdir: Path) -> Sample:
+        store = TokenStore(path=workdir / "tokens.json")
+        with store.minting_batch():
+            for i in range(count):
+                store.add_mask(TYPE_NAME, f"Person{i:04d}Name")
+        text = "the build succeeded after retrying the flaky test twice. " * 640
+        for _ in range(WARMUP_ITERATIONS):
+            tokenize(text, store)
+        latencies: list[float] = []
+        with _counting_io() as io:
+            start = time.perf_counter_ns()
+            for _ in range(200):
+                op = time.perf_counter_ns()
+                tokenize(text, store)
+                latencies.append((time.perf_counter_ns() - op) / 1e6)
+            total = time.perf_counter_ns() - start
+        return Sample(
+            total_ms=total / 1e6,
+            ops=200,
+            latencies_ms=latencies,
+            io=io,
+            notes={"masks": count, "text_chars": len(text)},
+        )
+
+    return run
+
+
+def case_mask_hits(count: int) -> CaseFn:
+    """Declared masks that actually appear, so every hit costs a store lookup.
+
+    Separate from :func:`case_mask_registry` because a miss is regex work only,
+    while a hit also resolves the literal back to its token. The gap between the
+    two is what a mask costs when it fires.
+    """
+
+    def run(workdir: Path) -> Sample:
+        store = TokenStore(path=workdir / "tokens.json")
+        with store.minting_batch():
+            for i in range(count):
+                store.add_mask(TYPE_NAME, f"Person{i:04d}Name")
+        text = "Person0001Name met Person0002Name about the report. " * 200
+        for _ in range(WARMUP_ITERATIONS):
+            tokenize(text, store)
+        latencies: list[float] = []
+        with _counting_io() as io:
+            start = time.perf_counter_ns()
+            for _ in range(200):
+                op = time.perf_counter_ns()
+                tokenize(text, store)
+                latencies.append((time.perf_counter_ns() - op) / 1e6)
+            total = time.perf_counter_ns() - start
+        return Sample(
+            total_ms=total / 1e6,
+            ops=200,
+            latencies_ms=latencies,
+            io=io,
+            notes={"masks": count, "hits_per_call": text.count("Person")},
+        )
+
+    return run
+
+
 def case_no_match_baseline() -> CaseFn:
     """Text with no ``@`` and no ``«`` — the case almost every call is.
 
@@ -935,6 +1015,9 @@ def build_cases(quick: bool, deadline_s: float) -> dict[str, CaseFn]:
     cases["stream_char_by_char"] = case_stream_char_by_char()
     cases["stream_unclosed"] = case_stream_unclosed()
     cases["no_match_baseline"] = case_no_match_baseline()
+    for n in [1, 100, 1_000]:
+        cases[f"mask_registry_{n}"] = case_mask_registry(n)
+    cases["mask_hits_100"] = case_mask_hits(100)
     cases["regex_pathological"] = case_regex_pathological()
     for threads in [2, 8]:
         cases[f"concurrent_{threads}"] = case_concurrent(threads)

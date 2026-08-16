@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 from atom.agent.tools.context import RequestContext
-from atom.privacy.tokens import TOKEN_PATTERN_HINT, tokenize
+from atom.privacy.tokens import MASK_TYPES, TOKEN_PATTERN_HINT, tokenize
 from atom.runtime_context import RuntimeContextBlock, wrap_runtime_context_lines
 
 
@@ -90,6 +90,12 @@ _TOKEN_GUIDANCE = (
     "The user sees the real value in your replies, so write placeholders "
     "naturally as if they were the value itself. Do not mention that they are "
     "placeholders.",
+    # The whole reason masks carry specific types rather than one generic `text`.
+    # Without this line the model has the label but no reason to read it, and a
+    # placeholder it cannot classify is one it writes ungrammatical prose around.
+    "The word before the colon says what kind of value it is — "
+    + ", ".join(f"{name} is {description}" for name, description in MASK_TYPES.items())
+    + ". Use it to choose correct grammar and pronouns.",
 )
 
 
