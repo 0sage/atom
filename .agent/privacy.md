@@ -572,8 +572,63 @@ written to disk inside every placeholder. `TYPE_TEXT` is deliberately *alongside
 the specific types rather than a default; as a default it would quietly become the
 common case and give back the ambiguity the specific types remove.
 
-`MASK_TYPES` is a closed set, not a free-form field, so `/mask nmae` is refused
-rather than minting a type nothing has guidance for.
+`MASK_TYPES` is the *seeded* set, not a closed one — see below.
+
+### The type namespace is open, because a type is data
+
+Adding a type used to require a release: `validate_mask` checked membership in
+`MASK_TYPES`, so `/mask iban <value>` was refused until someone shipped a new
+version and redeployed the bot. That was the wrong coupling. A type exists to tell
+the model what kind of value a placeholder stands for; gating pure data behind a
+deploy buys no safety, and the engine already resolved arbitrary types —
+`«iban:cfb18868»` round-tripped before any of this changed.
+
+So `validate_mask` now checks the *shape* of a type rather than its membership.
+`MASK_TYPES` keeps its job: it is the set carrying descriptions, which is what
+`_TOKEN_GUIDANCE` hands the model.
+
+Three guards, each from a verified failure rather than a guess:
+
+- **`_TYPE_RE` is `[a-z]+`**, matching what `_TOKEN_RE` resolves. `IBAN` is
+  casefolded to `iban`, but `bank_account` and `first-name` are **refused, not
+  normalized**: silently rewriting `bank_account` to `bankaccount` would rewrite a
+  string that is then written to disk inside every placeholder minted from it, and
+  renaming a type after the fact is a data migration.
+- **`MAX_TYPE_LENGTH = 24`, derived from `stream.py`'s `MAX_HELD_CHARS = 48`.** The
+  stream resolver holds at most 48 characters waiting for a placeholder to close,
+  so `«` + type + `:` + 8 hex + `»` must fit — a hard ceiling of 37. Past it the
+  resolver releases the placeholder as ordinary prose instead of resolving it:
+  silently, and only when streaming, which is the normal path. A test derives the
+  bound from `MAX_HELD_CHARS` so the two constants cannot drift apart.
+- **`RESERVED_TYPES = {email, secret}`.** `email` is load-bearing — it is the
+  discriminator separating discovered addresses from declared masks, so an entry
+  declared with it is excluded from the mask index and **can never match
+  anything**. Verified inert before the guard existed: `/mask email <literal>`
+  minted an entry, consumed a slot, and did nothing. `secret` is reserved forward
+  so credential-shaped placeholders can be given that meaning later without
+  colliding with an operator's mask.
+
+**Accepted regression, and it is a real one.** `/mask nmae Alexey` used to be
+refused with the valid types listed; it now succeeds and mints a junk type. That is
+the price of extensibility, and it is mitigated rather than solved: the reply names
+the new type and says `/mask del <value>` undoes it, and `/mask` listings show type
+names, so a typo is visible in both places the user is already looking. The note
+fires *only* for types outside `MASK_TYPES` — on every add it would be noise, and
+noise gets ignored precisely when it matters.
+
+`_TOKEN_GUIDANCE` gained one generic sentence for this: a placeholder whose type is
+not in the documented list is still personal data, and the type name should be read
+as its own description. Stated generically on purpose — enumerating live types would
+mean walking the store to build a prompt every turn, and a declared type name
+(`iban`, `passport`) is usually self-describing anyway.
+
+**What this is not.** A custom type is a *label*, not a detector. Verified:
+declaring one IBAN masks that exact value, and a different real IBAN passes through
+in plaintext. Automatic discovery of a new pattern is a separate decision requiring
+a self-verifying check (a checksum, not a shape — mod-97 killed both false positives
+a shape-only IBAN regex found in one ordinary sentence) plus an explicit marker-gate
+decision, which IBAN makes awkward since it has a strong checksum but no distinctive
+literal to gate on.
 
 ### The hazard is corrupting text, not performance
 

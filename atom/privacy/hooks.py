@@ -96,6 +96,15 @@ _TOKEN_GUIDANCE = (
     "The word before the colon says what kind of value it is — "
     + ", ".join(f"{name} is {description}" for name, description in MASK_TYPES.items())
     + ". Use it to choose correct grammar and pronouns.",
+    # An operator can declare any type from chat (`/mask iban …`), so the list
+    # above is the documented set, not the possible set. Without this line an
+    # undocumented type reads as a label the model has no instruction for, and the
+    # observed behaviour then is to treat it as noise rather than as data. Stated
+    # generically on purpose: enumerating live types would mean walking the store
+    # to build a prompt, and the type name is usually self-describing anyway.
+    "Other types may appear — the operator can define their own. A placeholder "
+    "whose type is not listed above is still personal data: read the type name as "
+    "the description and follow the same rules.",
 )
 
 

@@ -25,9 +25,12 @@ USAGE = (
     "/mask — list what is masked\n"
     "/mask TYPE value — mask a value\n"
     "/mask del value — stop masking a value\n\n"
-    "Types: "
+    "Documented types: "
     + ", ".join(sorted(MASK_TYPES))
-    + "\n\nExample: /mask name Alexey\n"
+    + "\n\nAny other single lowercase word works too, so /mask iban <value> needs "
+    "no upgrade. A type must be one lowercase word — no digits, spaces, hyphens "
+    "or underscores.\n\n"
+    "Example: /mask name Alexey\n"
     "The type is required: nothing in a value says whether it is a first name or "
     "a company, and the model uses the type to choose correct grammar."
 )
@@ -121,12 +124,24 @@ def _add(store: TokenStore, entity_type: str, value: str) -> MaskReply:
             carried_value=True,
         )
 
-    return MaskReply(
+    lines = [
         f"Masking as {checked_type} ({len(checked_value)} chars). "
         "It will be replaced in messages and tool output from now on; "
-        "text already in history is unchanged.",
-        carried_value=True,
-    )
+        "text already in history is unchanged."
+    ]
+
+    if checked_type not in MASK_TYPES:
+        # The cost of an open type namespace: `/mask nmae Alexey` used to be
+        # refused with the valid types listed, and now succeeds. Naming the new
+        # type back is what makes a typo visible in the one place the user is
+        # already looking — the value is never quoted, only the type.
+        lines.append(
+            f"\nNote: '{checked_type}' is a new type, so the model gets no "
+            "description of what it means. If that was a typo, /mask del <value> "
+            "undoes it."
+        )
+
+    return MaskReply("\n".join(lines), carried_value=True)
 
 
 def _delete(store: TokenStore, value: str) -> MaskReply:

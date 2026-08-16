@@ -96,10 +96,12 @@ TYPE_EMAIL = "email"
 #: ``_TOKEN_GUIDANCE`` exists precisely because it behaves badly when it cannot
 #: tell. Resolution is type-agnostic, so the label costs nothing structurally.
 #:
-#: A closed set, not a free-form field: a typo (``/mask nmae``) would otherwise
-#: mint a type the model has no guidance for. Adding one is a one-line change and
-#: needs no schema bump — but *renaming* one means migrating live data, since the
-#: type is written to disk inside every placeholder.
+#: The *seeded* set, not a closed one: ``/mask`` accepts any type matching
+#: :data:`_TYPE_RE`, so an operator can declare ``iban`` or ``passport`` from chat
+#: without a release. These are the ones carrying a description, which is what
+#: ``_TOKEN_GUIDANCE`` hands the model. Adding one here needs no schema bump — but
+#: *renaming* one means migrating live data, since the type is written to disk
+#: inside every placeholder.
 TYPE_NAME = "name"
 TYPE_SURNAME = "surname"
 TYPE_ADDRESS = "address"
@@ -112,8 +114,10 @@ TYPE_COMPANY = "company"
 #: give the model back the ambiguity the specific types remove.
 TYPE_TEXT = "text"
 
-#: What ``/mask`` accepts, mapped to a short description for its usage text and
-#: for the guidance the model receives.
+#: The types that ship with a description, for the usage text and for the guidance
+#: the model receives. ``/mask`` is not limited to these — see :func:`validate_mask`
+#: — but a type outside this dict reaches the model as a bare label, which is why
+#: ``_TOKEN_GUIDANCE`` carries a fallback sentence for that case.
 MASK_TYPES: dict[str, str] = {
     TYPE_NAME: "a person's given name",
     TYPE_SURNAME: "a person's family name",
@@ -129,6 +133,33 @@ MASK_TYPES: dict[str, str] = {
 #: failure the email pattern's strictness exists to avoid. Measured, not guessed:
 #: both match ordinary prose twice in a single test sentence.
 MIN_MASK_LENGTH = 4
+
+#: A type must be a single lowercase word, because :data:`_TOKEN_RE` only resolves
+#: ``[a-z]+`` — a placeholder written with any other shape would reach the user as
+#: literal text forever. Enforced here rather than left to the caller so the
+#: refusal names the rule instead of silently minting an unresolvable entry.
+_TYPE_RE = re.compile(r"[a-z]+")
+
+#: Longest type ``/mask`` will register, and the constraint is not cosmetic.
+#: ``stream.py`` holds at most ``MAX_HELD_CHARS`` (48) characters while waiting for
+#: a placeholder to close, so ``«`` + type + ``:`` + 8 hex + ``»`` must fit: that
+#: caps a type at 37. Past it the resolver releases the placeholder as ordinary
+#: prose instead of resolving it — silently, and only when streaming, which is the
+#: normal path. 24 leaves margin and is still longer than any plausible label.
+MAX_TYPE_LENGTH = 24
+
+#: Type names ``/mask`` refuses even though they match :data:`_TYPE_RE`.
+#:
+#: ``email`` is load-bearing: it is the discriminator separating discovered
+#: addresses from declared masks (see :meth:`TokenStore.masks` and
+#: ``_by_folded_mask``), so an entry declared with it is excluded from the mask
+#: index and can never match anything. Verified inert before this guard existed —
+#: it minted an entry, consumed a slot, and did nothing.
+#:
+#: ``secret`` is reserved forward. Credentials are handled by ``/secrets`` and
+#: never resolve back; keeping the name free means a placeholder shape can be
+#: given that meaning later without colliding with an operator's mask.
+RESERVED_TYPES = frozenset({TYPE_EMAIL, "secret"})
 
 #: Shown to the model so it can recognize a placeholder. A literal example
 #: rather than a regex: models follow examples more reliably than patterns.
@@ -284,10 +315,35 @@ def validate_mask(entity_type: str, value: str) -> tuple[str, str]:
     forget to check. Every rule here exists because breaking it corrupts the text
     the agent reasons over, which is worse than not masking at all.
     """
+    # Casefolded so `/mask IBAN …` works from a phone keyboard, but *not* stripped
+    # of separators: turning `bank_account` into `bankaccount` would silently
+    # rewrite a string that is then written to disk inside every placeholder, and
+    # renaming a type after the fact means migrating live data. Refuse and name the
+    # rule instead.
     entity_type = entity_type.strip().casefold()
-    if entity_type not in MASK_TYPES:
+    if not entity_type:
+        raise MaskError("A type is required, e.g. /mask name Alexey")
+
+    if not _TYPE_RE.fullmatch(entity_type):
         known = ", ".join(sorted(MASK_TYPES))
-        raise MaskError(f"Unknown type. Use one of: {known}")
+        raise MaskError(
+            "A type must be a single lowercase word with no digits, spaces, "
+            "hyphens or underscores — 'iban' works, 'bank_account' does not. "
+            f"The documented types are: {known}"
+        )
+
+    if len(entity_type) > MAX_TYPE_LENGTH:
+        raise MaskError(
+            f"That type is too long (maximum {MAX_TYPE_LENGTH} characters). "
+            "A longer one would not survive being streamed back to you."
+        )
+
+    if entity_type in RESERVED_TYPES:
+        raise MaskError(
+            f"'{entity_type}' is reserved and cannot be used as a mask type. "
+            "Addresses are found automatically, and credentials belong in "
+            "/secrets."
+        )
 
     # Collapse internal runs of whitespace so "Acme   Corp" and "Acme Corp" are
     # one mask. A literal with a doubled space would otherwise never match text

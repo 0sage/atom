@@ -9,8 +9,11 @@ import stat
 import pytest
 
 from atom.privacy import tokens as tokens_module
+from atom.privacy.stream import MAX_HELD_CHARS, PlaceholderStreamResolver
 from atom.privacy.tokens import (
     MASK_TYPES,
+    MAX_TYPE_LENGTH,
+    RESERVED_TYPES,
     SCHEMA_VERSION,
     TYPE_COMPANY,
     TYPE_EMAIL,
@@ -962,13 +965,18 @@ class TestMaskValidation:
     def test_the_minimum_length_is_inclusive(self) -> None:
         assert validate_mask(TYPE_NAME, "Alex") == (TYPE_NAME, "Alex")
 
-    def test_an_unknown_type_is_refused(self) -> None:
-        with pytest.raises(MaskError, match="Unknown type"):
-            validate_mask("nmae", "Alexey")
+    def test_an_undocumented_type_is_accepted(self) -> None:
+        """The namespace is open: `/mask iban …` must work without a release.
 
-    def test_the_error_lists_the_known_types(self) -> None:
+        This replaced a test pinning the opposite. A type is a label the model
+        reads, so gating it behind a deploy bought no safety — see
+        ``TestOpenTypeNamespace`` for the shape rules that still apply.
+        """
+        assert validate_mask("iban", "GB82WEST12345698765432")[0] == "iban"
+
+    def test_a_malformed_type_error_lists_the_known_types(self) -> None:
         with pytest.raises(MaskError) as excinfo:
-            validate_mask("nmae", "Alexey")
+            validate_mask("bank_account", "Alexey")
         for known in MASK_TYPES:
             assert known in str(excinfo.value)
 
@@ -992,7 +1000,7 @@ class TestMaskValidation:
     def test_a_refusal_never_quotes_the_value(self) -> None:
         secret = "Alexey"
         with pytest.raises(MaskError) as excinfo:
-            validate_mask("nmae", secret)
+            validate_mask("bank_account", secret)
         assert secret not in str(excinfo.value)
 
     def test_every_declared_type_is_resolvable(self) -> None:
@@ -1000,3 +1008,91 @@ class TestMaskValidation:
         for entity_type in MASK_TYPES:
             token = placeholder(entity_type, "a1b2c3d4")
             assert tokens_module._TOKEN_RE.fullmatch(token), entity_type
+
+
+class TestOpenTypeNamespace:
+    """A type may be any single lowercase word, so it can be declared from chat.
+
+    The engine always resolved arbitrary types — ``_TOKEN_RE`` is ``[a-z]+`` — and
+    only ``validate_mask`` refused them, which meant adding a label required a
+    release. These pin the shape rules that replaced the closed set, and each rule
+    exists because breaking it produces a placeholder that silently never resolves.
+    """
+
+    def test_an_undeclared_type_round_trips(self, store: TokenStore) -> None:
+        iban = "GB82WEST12345698765432"
+        entity_type, value = validate_mask("iban", iban)
+        store.add_mask(entity_type, value)
+        masked = tokenize(f"pay {iban} today", store=store)
+        assert "«iban:" in masked
+        assert iban not in masked
+        assert detokenize(masked, store=store) == f"pay {iban} today"
+
+    def test_a_type_is_case_folded_to_reach_the_resolver(self) -> None:
+        """`/mask IBAN …` from a phone keyboard must not mint `«IBAN:…»`."""
+        entity_type, _ = validate_mask("IBAN", "GB82WEST12345698765432")
+        assert entity_type == "iban"
+        assert tokens_module._TOKEN_RE.fullmatch(placeholder(entity_type, "a1b2c3d4"))
+
+    @pytest.mark.parametrize(
+        "bad_type",
+        ["bank_account", "first-name", "iban2", "two words", "Iban!", "  "],
+    )
+    def test_a_type_that_would_not_resolve_is_refused(self, bad_type: str) -> None:
+        """Refused rather than normalized: the type is written to disk inside every
+        placeholder, so silently rewriting it strands the entries already minted."""
+        with pytest.raises(MaskError):
+            validate_mask(bad_type, "GB82WEST12345698765432")
+
+    @pytest.mark.parametrize("reserved", sorted(RESERVED_TYPES))
+    def test_a_reserved_type_is_refused(self, reserved: str) -> None:
+        """`email` is the discriminator separating discovered from declared values.
+
+        An entry declared with it is excluded from the mask index, so it occupies a
+        slot and can never match anything — verified inert before this guard. Naming
+        the type in the message is safe; the value is never quoted.
+        """
+        with pytest.raises(MaskError, match="reserved"):
+            validate_mask(reserved, "SomeLiteralValue")
+
+    def test_a_reserved_type_refusal_does_not_quote_the_value(self) -> None:
+        secret = "SomeLiteralValue"
+        with pytest.raises(MaskError) as excinfo:
+            validate_mask(TYPE_EMAIL, secret)
+        assert secret not in str(excinfo.value)
+
+    def test_the_length_cap_is_inclusive(self) -> None:
+        entity_type = "a" * MAX_TYPE_LENGTH
+        assert validate_mask(entity_type, "GB82WEST123456")[0] == entity_type
+
+    def test_a_longer_type_is_refused(self) -> None:
+        with pytest.raises(MaskError, match="too long"):
+            validate_mask("a" * (MAX_TYPE_LENGTH + 1), "GB82WEST123456")
+
+    def test_the_cap_keeps_a_placeholder_within_the_stream_hold_window(self) -> None:
+        """The reason for the cap, derived rather than hardcoded.
+
+        ``PlaceholderStreamResolver`` holds at most ``MAX_HELD_CHARS`` characters
+        while waiting for a placeholder to close. A longer placeholder is released
+        as ordinary prose instead of resolving — silently, and only when streaming,
+        which is the normal path. Deriving the bound here means the two constants
+        cannot drift apart unnoticed.
+        """
+        widest = placeholder("a" * MAX_TYPE_LENGTH, "a1b2c3d4")
+        assert len(widest) <= MAX_HELD_CHARS
+
+    def test_a_capped_type_survives_a_split_delta_stream(
+        self, store: TokenStore
+    ) -> None:
+        """The end-to-end version: fed one character at a time, it still resolves.
+
+        The ``store`` fixture redirects ``DEFAULT_TOKEN_STORE``, which is what the
+        resolver reads — it takes no store argument.
+        """
+        entity_type = "a" * MAX_TYPE_LENGTH
+        token = store.add_mask(entity_type, "GB82WEST123456")
+        assert token is not None
+        resolver = PlaceholderStreamResolver()
+        emitted = "".join(resolver(char, stream_id="s") for char in f"pay {token} now")
+        emitted += resolver.flush("s")
+        assert "GB82WEST123456" in emitted

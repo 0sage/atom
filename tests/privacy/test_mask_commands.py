@@ -52,6 +52,46 @@ class TestAdding:
         assert len(store) == 0
 
 
+class TestANewTypeIsFlagged:
+    """An open namespace means a typo now succeeds, so the reply has to say so.
+
+    ``/mask nmae Alexey`` was refused with the valid types listed; it now mints a
+    type nobody meant. The note is the whole mitigation, and it must appear only
+    for types outside :data:`MASK_TYPES` — on every add, it would be noise that
+    gets ignored precisely when it matters.
+    """
+
+    def test_an_undocumented_type_is_stored_and_works(self, store: TokenStore) -> None:
+        iban = "GB82WEST12345698765432"
+        handle_mask_command(f"iban {iban}", store)
+        assert "«iban:" in tokenize(f"pay {iban}", store=store)
+
+    def test_the_reply_flags_a_new_type(self, store: TokenStore) -> None:
+        text = handle_mask_command("iban GB82WEST12345698765432", store).text
+        assert "new type" in text
+        assert "iban" in text
+
+    def test_the_reply_says_how_to_undo(self, store: TokenStore) -> None:
+        """The note is useless if it names the problem without the remedy."""
+        text = handle_mask_command("nmae Someone", store).text
+        assert "/mask del" in text
+
+    def test_a_documented_type_is_not_flagged(self, store: TokenStore) -> None:
+        assert "new type" not in handle_mask_command("name Alexey", store).text
+
+    def test_the_note_never_quotes_the_value(self, store: TokenStore) -> None:
+        iban = "GB82WEST12345698765432"
+        assert iban not in handle_mask_command(f"iban {iban}", store).text
+
+    def test_the_listing_shows_a_typo_type(self, store: TokenStore) -> None:
+        """The second place a typo becomes visible, without printing values."""
+        handle_mask_command("nmae Someone", store)
+        assert "nmae" in handle_mask_command("", store).text
+
+    def test_usage_documents_the_open_namespace(self) -> None:
+        assert "lowercase word" in USAGE
+
+
 class TestListing:
     def test_empty_listing_shows_usage(self, store: TokenStore) -> None:
         assert "Nothing is masked" in handle_mask_command("", store).text
@@ -101,9 +141,9 @@ class TestRemoving:
 
 
 class TestRefusals:
-    def test_an_unknown_type_lists_the_valid_ones(self, store: TokenStore) -> None:
-        text = handle_mask_command("nmae Alexey", store).text
-        assert "Unknown type" in text
+    def test_a_malformed_type_lists_the_documented_ones(self, store: TokenStore) -> None:
+        text = handle_mask_command("bank_account Alexey", store).text
+        assert "single lowercase word" in text
         for known in MASK_TYPES:
             assert known in text
 
@@ -114,10 +154,10 @@ class TestRefusals:
 
     def test_a_refusal_still_deletes_the_message(self, store: TokenStore) -> None:
         """A value typed beside a bad type was still typed into the chat."""
-        assert handle_mask_command("nmae Alexey", store).carried_value is True
+        assert handle_mask_command("bank_account Alexey", store).carried_value is True
 
     def test_a_refusal_never_quotes_the_value(self, store: TokenStore) -> None:
-        assert "Alexey" not in handle_mask_command("nmae Alexey", store).text
+        assert "Alexey" not in handle_mask_command("bank_account Alexey", store).text
 
     def test_help_shows_usage_without_deleting(self, store: TokenStore) -> None:
         reply = handle_mask_command("help", store)
