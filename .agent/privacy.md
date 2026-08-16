@@ -343,43 +343,55 @@ map to `MAX_ENTRIES` with 9,948 synthetic addresses, which also capped real
 tokenization. Anything that constructs a `TokenStore` outside pytest is on the
 path the suite cannot see.
 
-### The cold path is quadratic, and that is the open defect
+### Minting saves once per call, not once per value
 
-`_save` reserializes the entire map on every new value, so minting *n* addresses
-writes O(n²) bytes. Measured on APFS/NVMe — the fastest rung of the ladder:
+`_save` reserializes the entire map, so saving per newly minted value made
+minting *n* addresses write O(n²) bytes. Measured on APFS/NVMe, the fastest rung:
+800 addresses took 926 ms and wrote 65 MB to produce a 160 KB file — 401×
+amplification, ~3.6× per doubling. Reaching `MAX_ENTRIES` took ~130 s there and
+~400 s on flash.
 
-| New addresses | Time | Bytes written | Final file | Amplification |
-| --- | --- | --- | --- | --- |
-| 100 | 34 ms | — | 20 KB | — |
-| 800 | 926 ms | 65 MB | 160 KB | 401× |
-| 1600 | 3.3 s | — | 320 KB | — |
-| 10,000 (extrapolated) | ~130 s | — | 2 MB | — |
+**The cost was serialization, not durability.** `json.dumps` with `indent=2` over
+the whole map was ~99% of `_save`; the two `fsync` calls were 4%. That contradicts
+the obvious guess — the first prediction was that fsync would dominate, and it
+does not on any rung measured. It is also why `indent=2` was kept: dropping it
+buys 2.3× alone and nothing on top of batching, and a readable file is what an
+operator needs when pruning.
 
-Doubling the input costs ~3.6×, so it is quadratic rather than linear.
+`tokenize` now wraps its substitutions in `TokenStore.minting_batch`. A bulk tool
+result carrying 10,000 new addresses went from *not completing inside 45 s on any
+rung* to 60 ms locally and 431 ms on the Pi.
 
-**The cost is serialization, not durability.** `json.dumps` with `indent=2` over
-the whole map accounts for ~99% of `_save`; the two `fsync` calls are 4%. That
-contradicts the obvious guess — the first prediction when this was investigated
-was that fsync would dominate, and it does not, on any rung measured so far.
+Two properties the batch has to preserve, both easy to get wrong:
 
-Consequences, in the order they matter:
+**The save happens before the caller sees the text.** It is inside the context
+manager, not deferred past it. An `OSError` propagates and fails the call, because
+by then every substitution has been made — returning the text would hand back
+placeholders with no entry behind them and the addresses would be unrecoverable.
+Failing is the deliberate choice for a feature that exists to prevent disclosure.
 
-- A bulk tool result carrying thousands of new addresses stalls the turn. At the
-  cap it is ~130 s on the fastest hardware supported.
-- Throughput is ~810 new addresses/second against ~1.2M already-mapped ones —
-  three orders of magnitude apart for the same call.
-- `MAX_ENTRIES` is what keeps this bounded rather than unbounded, which is a
-  second reason the cap exists beyond the disclosure argument above.
+**The batch must not consume `_touch`'s first-use write-through.** `_last_flush`
+starts at 0.0 so a process that resolves one token and exits still records it.
+Restarting that timer at batch exit put the first resolution inside the throttle
+window and broke two tests; the exit clears `_usage_dirty` (the save wrote the
+counters too) but leaves the timer alone.
 
-Not fixed here, because the fix is a storage-format change and this was found
-while building the benchmark. The options, cheapest first: batch one save per
-`tokenize` call rather than per value; drop `indent=2` on write; append new
-entries to a journal and compact periodically. The first is enough for the tool
-result case, which is the one that hurts.
+Nesting is counted rather than flagged, so an inner block cannot save early and
+leave the outer one believing its entries are durable. The lock is held for the
+whole block: minting already serialized per value, and letting one thread's exit
+decide another thread's durability is an ordering bug that only appears under load.
 
-`tests/privacy/test_perf_budget.py` pins the *shape* (per-mint cost rises with
-map size) rather than a duration, so it documents the defect and notices if it is
-fixed.
+`token_for` called directly, outside a batch, still saves immediately — unchanged.
+
+**What batching cannot do:** collapse saves *across* calls. 10,000 addresses in
+one call cost one save; the same addresses in 400 calls cost 400, and on the Pi
+that is 431 ms versus 11.2 s. Both shapes are real (one bulk tool result versus a
+stream of small ones), which is why `bench_privacy` reports `mint_rate_bulk_1s`
+and `mint_rate_1s` separately rather than picking one. Cross-call coalescing is
+the next lever if a chatty-MCP workload ever justifies it.
+
+`MAX_ENTRIES` still exists for the disclosure argument above; it is no longer also
+load-bearing for performance.
 
 ### `_EMAIL_RE` needs its lookbehind to stay linear
 

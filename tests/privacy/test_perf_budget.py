@@ -129,46 +129,76 @@ class TestPathologicalInputDoesNotStall:
         assert large < max(small, 0.05) * 10, f"{small:.3f}ms -> {large:.3f}ms"
 
 
-class TestColdPathCostIsKnown:
-    """Minting is the expensive path, and its shape is a known defect.
+class TestColdPathScalesLinearly:
+    """Minting is the expensive path, and batching is what keeps it linear.
 
-    ``TokenStore._save`` reserializes the entire map for every new value, so
-    minting *n* addresses is O(n^2) in bytes written — measured at 401x write
-    amplification for 800 addresses, ~99% of it in ``json.dumps``. These tests
-    pin the shape rather than a duration, so they document the defect and will
-    notice if it is fixed or made worse.
+    ``_save`` rewrites the whole map, so saving once per newly minted value made
+    minting *n* values quadratic in bytes written: 800 addresses wrote 65MB to
+    produce a 160KB file, ~99% of it in ``json.dumps`` rather than ``fsync``.
+    ``tokenize`` now wraps its substitutions in ``minting_batch``, so one call
+    costs one save however many addresses it carries.
 
-    See ``.agent/privacy.md`` and ``scripts/bench_privacy.py``.
+    These pin the shape rather than a duration, so they hold on any host and fail
+    if the batching is removed or bypassed. See ``.agent/privacy.md`` and
+    ``scripts/bench_privacy.py``.
     """
 
-    def test_each_new_address_rewrites_the_whole_map(self, store: TokenStore) -> None:
-        for i in range(20):
-            tokenize(f"user{i}@example.com", store=store)
-            assert len(store) == i + 1
+    def test_one_call_costs_one_save(self, store: TokenStore) -> None:
+        """The property the whole fix rests on."""
+        saves = 0
+        real = TokenStore._save
 
-        # One save per mint is the defect in one line: were saves batched per
-        # call, 20 addresses in 20 calls would still be 20 saves, but the file
-        # would not have to be rebuilt from scratch each time.
-        assert store.path.stat().st_size > 0
+        def counting(self: TokenStore) -> None:
+            nonlocal saves
+            saves += 1
+            real(self)
 
-    def test_per_mint_cost_grows_with_map_size(self, store: TokenStore) -> None:
-        """Pins the direction, not the magnitude, so it holds on any host."""
+        TokenStore._save = counting  # pyright: ignore[reportAttributeAccessIssue]
+        try:
+            tokenize(" ".join(f"u{i}@example.com" for i in range(200)), store=store)
+        finally:
+            TokenStore._save = real  # pyright: ignore[reportAttributeAccessIssue]
 
-        def mint_batch(start: int, count: int = 40) -> float:
-            text = " ".join(f"u{i}@example.com" for i in range(start, start + count))
-            return _elapsed_ms(tokenize, text, store=store)
+        assert saves == 1, f"200 new addresses cost {saves} saves, expected 1"
+        assert len(store) == 200
 
-        first = mint_batch(0)
-        mint_batch(1_000, count=400)  # grow the map
-        later = mint_batch(5_000)
+    def test_doubling_the_input_does_not_quadruple_the_cost(self, tmp_path) -> None:
+        """Quadratic would be ~4x for 2x the input; linear is ~2x.
 
-        assert later > first, (
-            f"minting into a large map ({later:.1f}ms) was not slower than into "
-            f"a small one ({first:.1f}ms) — if saves are now batched, update this"
-        )
+        Each size gets a fresh store, so what is measured is minting from empty
+        rather than minting into a map the previous size already filled.
+        """
 
-    def test_cap_stops_the_map_growing_without_bound(self, store: TokenStore) -> None:
-        """The cap is what keeps the quadratic cost from being unbounded."""
+        def cost(count: int) -> float:
+            fresh = TokenStore(path=tmp_path / f"map-{count}.json")
+            text = " ".join(f"u{i}@example.com" for i in range(count))
+            return _elapsed_ms(tokenize, text, store=fresh)
+
+        cost(200)  # discard: first call pays for lazily compiled internals
+        small = cost(400)
+        large = cost(800)
+
+        # The bound sits between linear and quadratic, with room for timer noise
+        # on a loaded host and for the floor to matter when `small` is fast.
+        assert large < max(small, 0.5) * 3.5, f"{small:.2f}ms -> {large:.2f}ms"
+
+    def test_reaching_the_cap_is_not_pathological(self, tmp_path) -> None:
+        """Filling the map used to take ~130s locally and ~400s on flash.
+
+        A generous ceiling: the point is that this finishes at all, not the exact
+        figure. Before batching it could not have run inside a test suite.
+        """
+        from atom.privacy.tokens import MAX_ENTRIES
+
+        fresh = TokenStore(path=tmp_path / "full.json")
+        text = " ".join(f"u{i}@example.com" for i in range(MAX_ENTRIES))
+        elapsed = _elapsed_ms(tokenize, text, store=fresh)
+
+        assert len(fresh) == MAX_ENTRIES
+        assert elapsed < 20_000, f"filling the map took {elapsed / 1000:.1f}s"
+
+    def test_cap_still_bounds_the_map(self, store: TokenStore) -> None:
+        """Batching makes minting cheap; it does not remove the reason for a cap."""
         from atom.privacy.tokens import CAPPED_PLACEHOLDER, MAX_ENTRIES
 
         assert MAX_ENTRIES == 10_000

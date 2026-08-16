@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import stat
 
 import pytest
@@ -389,6 +390,111 @@ class TestExplicitStoreIsAlwaysHonoured:
 
         assert len(explicit) == 2
         assert len(default) == 0
+
+
+class TestMintingIsBatched:
+    """One save per ``tokenize`` call, not one per newly minted value.
+
+    ``_save`` rewrites the whole map, so saving per value made minting *n* values
+    quadratic in bytes written — 800 addresses wrote 65MB to produce a 160KB file,
+    and filling the map took ~130s locally and ~400s on flash. Batching is what
+    makes the cold path linear.
+
+    Durability is unchanged in the ways that matter: the save still happens before
+    the caller sees the text, and a direct ``token_for`` call outside a batch still
+    writes immediately.
+    """
+
+    def _saves_during(self, monkeypatch, fn) -> int:
+        calls = {"n": 0}
+        real = TokenStore._save
+
+        def counting(self: TokenStore) -> None:
+            calls["n"] += 1
+            real(self)
+
+        monkeypatch.setattr(TokenStore, "_save", counting)
+        fn()
+        return calls["n"]
+
+    def test_many_new_addresses_cost_one_save(self, store: TokenStore, monkeypatch) -> None:
+        text = " ".join(f"user{i}@example.com" for i in range(50))
+        saves = self._saves_during(monkeypatch, lambda: tokenize(text, store=store))
+        assert saves == 1
+        assert len(store) == 50
+
+    def test_every_entry_is_on_disk_when_the_call_returns(self, store: TokenStore) -> None:
+        """The batch must not defer past the point the caller can use the text."""
+        text = " ".join(f"user{i}@example.com" for i in range(20))
+        out = tokenize(text, store=store)
+
+        persisted = json.loads(store.path.read_text())["entries"]
+        assert len(persisted) == 20
+        # Every placeholder in the returned text resolves from the file alone.
+        reopened = TokenStore(path=store.path)
+        for token in re.findall(r"«email:[0-9a-f]{8}»", out):
+            assert reopened.value_for(token) is not None
+
+    def test_text_without_new_addresses_writes_nothing(
+        self, store: TokenStore, monkeypatch
+    ) -> None:
+        """A batch that mints nothing must not rewrite the map."""
+        store.token_for(TYPE_EMAIL, "alex@example.com")
+        saves = self._saves_during(
+            monkeypatch, lambda: tokenize("mail alex@example.com", store=store)
+        )
+        assert saves == 0
+
+    def test_direct_token_for_still_writes_immediately(self, store: TokenStore) -> None:
+        """Outside a batch, minting is as durable as it always was."""
+        token = store.token_for(TYPE_EMAIL, "alex@example.com")
+        assert token is not None
+        assert json.loads(store.path.read_text())["entries"][token]["hits"] == 0
+
+    def test_nested_batches_save_once_at_the_outermost_exit(
+        self, store: TokenStore, monkeypatch
+    ) -> None:
+        """An inner block must not declare the outer block's work durable."""
+
+        def nested() -> None:
+            with store.minting_batch():
+                store.token_for(TYPE_EMAIL, "a@example.com")
+                with store.minting_batch():
+                    store.token_for(TYPE_EMAIL, "b@example.com")
+                assert not store.path.exists(), "inner exit must not save"
+                store.token_for(TYPE_EMAIL, "c@example.com")
+
+        saves = self._saves_during(monkeypatch, nested)
+        assert saves == 1
+        assert len(TokenStore(path=store.path)) == 3
+
+    def test_a_failed_batch_save_fails_the_call(self, store: TokenStore, monkeypatch) -> None:
+        """Substitutions are already made, so a silent failure would strand them.
+
+        Returning the text after a failed save would hand back placeholders with
+        no entry behind them, making the addresses unrecoverable. Raising keeps
+        the invariant that a placeholder in returned text is resolvable.
+        """
+
+        def boom(self: TokenStore) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(TokenStore, "_save", boom)
+        with pytest.raises(OSError, match="disk full"):
+            tokenize("alex@example.com", store=store)
+
+    def test_first_resolution_still_writes_through_after_a_batch(
+        self, store: TokenStore
+    ) -> None:
+        """The batch must not consume the first-use write-through of `_touch`.
+
+        `_last_flush` starts at 0.0 so a process that resolves one token and exits
+        still records it. Restarting that timer at batch exit would put the first
+        resolution inside the throttle window instead.
+        """
+        token = tokenize("alex@example.com", store=store)
+        store.value_for(token.strip())
+        assert json.loads(store.path.read_text())["entries"][token.strip()]["hits"] == 1
 
 
 class TestPathologicalInputStaysLinear:

@@ -90,7 +90,11 @@ RESULT_SCHEMA = 1
 #: design. Gating it where the design actually sits keeps this about regressions
 #: rather than restating the defect documented in ``.agent/privacy.md``.
 BUDGETS: dict[str, tuple[str, str, float]] = {
-    "mint_rate_1s": ("ops_per_second", "at_least", 200.0),
+    "mint_rate_1s": ("ops_per_second", "at_least", 1_000.0),
+    # One call carrying everything, which is what a bulk tool result is. The Pi
+    # measures ~85k/s here against ~2.6k/s for the many-call shape; the floor sits
+    # well under the slowest rung so it catches a lost batch, not slow hardware.
+    "mint_rate_bulk_1s": ("ops_per_second", "at_least", 20_000.0),
     "warm_rate_1s": ("ops_per_second", "at_least", 60_000.0),
     "detokenize_rate_1s": ("ops_per_second", "at_least", 20_000.0),
     "user_text_warm": ("p95_ms", "at_most", 1.0),
@@ -297,10 +301,47 @@ def _timed_bulk(text: str, store: TokenStore, fn: Callable[[str, TokenStore], st
     return Sample(total_ms=elapsed / 1e6, ops=ops, io=io)
 
 
-#: Addresses per slice on the deadline-aware cold path. Small enough that the
-#: clock is checked often even when each mint is slow, large enough that the
-#: check is not itself part of what is being measured.
-_COLD_SLICE = 25
+#: Addresses per call on the drip-feed case. Represents a stream of small tool
+#: results rather than one bulk one, which is the shape that pays a save per call.
+_DRIP_SLICE = 25
+
+#: Addresses minted by the pre-flight probe. Small enough to be cheap on flash,
+#: large enough that a per-value save is unmistakable.
+_PROBE_SIZE = 100
+
+
+def _saves_per_call(workdir: Path) -> int:
+    """Count how many times one ``tokenize`` call writes the map.
+
+    The guard on the large cold cases. One save per call is the batched design and
+    linear; one save per *value* is the old quadratic behaviour, which takes ~130s
+    locally and ~400s on flash to reach ``MAX_ENTRIES`` and would make the ladder
+    unrunnable.
+
+    Counting saves rather than timing two probe sizes and inferring an exponent:
+    the exponent approach was tried and does not work at probe scale, because the
+    fixed per-save cost still dominates at a few hundred values and a regressed
+    engine reads as merely slow. This tests the property itself, so it cannot
+    confuse a slow host with a regression — which is the whole job.
+    """
+    store = TokenStore(path=workdir / "probe.json")
+    text = " ".join(
+        f"p{i} is probe.{i:06d}@probe.example.com;" for i in range(_PROBE_SIZE)
+    )
+    saves = 0
+    real = TokenStore._save
+
+    def counting(self: TokenStore) -> None:
+        nonlocal saves
+        saves += 1
+        real(self)
+
+    TokenStore._save = counting  # pyright: ignore[reportAttributeAccessIssue]
+    try:
+        tokenize(text, store)
+    finally:
+        TokenStore._save = real  # pyright: ignore[reportAttributeAccessIssue]
+    return saves
 
 
 def case_tool_result_cold(count: int, deadline_s: float) -> CaseFn:
@@ -308,13 +349,60 @@ def case_tool_result_cold(count: int, deadline_s: float) -> CaseFn:
 
     This is the case ``MAX_ENTRIES`` was written for: a single ``grep -r "@"``
     over a mail directory carries thousands of addresses the agent merely passed
-    over. At ``count=10000`` it would fill the map exactly.
+    over. At ``count=10000`` it fills the map exactly.
 
-    Minting is quadratic in the number of new values, because ``_save`` rewrites
-    the whole map per value, so a large *count* does not finish in any useful
-    time. The corpus is therefore fed in slices against a deadline and the sample
-    reports how far it got: an aborted case yields a throughput figure at the map
-    size it reached, which is the number worth comparing across rungs anyway.
+    The corpus is passed in **one** ``tokenize`` call, because that is what a tool
+    result is. This matters more than it sounds: ``tokenize`` saves once per call,
+    so feeding the same corpus in slices measures the harness's own call boundaries
+    instead of the engine — 10k addresses cost 60ms in one call and 5.1s in 400
+    slices on the same host. See :func:`case_mint_drip` for the sliced shape,
+    measured deliberately rather than by accident.
+    """
+
+    def run(workdir: Path) -> Sample:
+        # Only the large cases are worth guarding; a small one finishes either
+        # way, and running it unguarded keeps a regression visible as a slow
+        # number rather than a skip.
+        if count > _PROBE_SIZE:
+            saves = _saves_per_call(workdir)
+            if saves > 1:
+                return Sample(
+                    total_ms=0.0,
+                    ops=0,
+                    notes={
+                        "requested": count,
+                        "skipped": (
+                            f"minting is not batched: {saves} saves for "
+                            f"{_PROBE_SIZE} values, so this case is quadratic"
+                        ),
+                        "saves_per_call": saves,
+                        "aborted_at_deadline_s": deadline_s,
+                    },
+                )
+        store = TokenStore(path=workdir / "tokens.json")
+        text = " ".join(f"contact {i} is {address(i)};" for i in range(count))
+        with _counting_io() as io:
+            start = time.perf_counter_ns()
+            tokenize(text, store)
+            elapsed = time.perf_counter_ns() - start
+        sample = Sample(total_ms=elapsed / 1e6, ops=count, io=io)
+        sample.notes["map_entries"] = len(store)
+        sample.notes["requested"] = count
+        sample.notes["map_bytes"] = store.path.stat().st_size if store.path.exists() else 0
+        return sample
+
+    return run
+
+
+def case_mint_drip(count: int, deadline_s: float) -> CaseFn:
+    """The same addresses arriving as many small calls instead of one.
+
+    A stream of small tool results, or a chatty MCP server. Each call saves once,
+    so this is where per-call durability cost shows up, and it is the upper bound
+    on what batching can do: batching collapses saves *within* a call and cannot
+    collapse saves across calls. Worth measuring because the gap between this and
+    :func:`case_tool_result_cold` is the argument for any future cross-call
+    coalescing.
     """
 
     def run(workdir: Path) -> Sample:
@@ -324,17 +412,16 @@ def case_tool_result_cold(count: int, deadline_s: float) -> CaseFn:
         budget_ns = int(deadline_s * 1e9)
         with _counting_io() as io:
             start = time.perf_counter_ns()
-            for offset in range(0, count, _COLD_SLICE):
-                chunk = " ".join(segments[offset:offset + _COLD_SLICE])
-                tokenize(chunk, store)
-                done += min(_COLD_SLICE, count - offset)
+            for offset in range(0, count, _DRIP_SLICE):
+                tokenize(" ".join(segments[offset:offset + _DRIP_SLICE]), store)
+                done += min(_DRIP_SLICE, count - offset)
                 if time.perf_counter_ns() - start > budget_ns:
                     break
             elapsed = time.perf_counter_ns() - start
         sample = Sample(total_ms=elapsed / 1e6, ops=done, io=io)
         sample.notes["map_entries"] = len(store)
         sample.notes["requested"] = count
-        sample.notes["map_bytes"] = store.path.stat().st_size if store.path.exists() else 0
+        sample.notes["calls"] = (done + _DRIP_SLICE - 1) // _DRIP_SLICE
         if done < count:
             sample.notes["aborted_at_deadline_s"] = deadline_s
         return sample
@@ -345,9 +432,14 @@ def case_tool_result_cold(count: int, deadline_s: float) -> CaseFn:
 def case_mint_rate(budget_s: float = 1.0) -> CaseFn:
     """How many previously unseen addresses can be tokenized in *budget_s*.
 
-    The direct answer to "how many emails per second", on the expensive path.
-    Reported as a rate rather than a time so it stays meaningful on a rung where
-    the quadratic cost means the answer is a few hundred rather than thousands.
+    "How many emails a second" for the expensive path, and the pessimistic answer
+    of the two: filling a one-second budget requires many calls, each of which
+    saves once, so this measures per-call durability against a map that grows
+    throughout. The optimistic answer — one call carrying everything — is
+    :func:`case_tool_result_cold`, and on the same host the two differ by ~40x.
+
+    Both are real. This one is a chatty stream of small results; that one is a
+    single bulk result. Neither alone describes the engine.
     """
 
     def run(workdir: Path) -> Sample:
@@ -359,10 +451,10 @@ def case_mint_rate(budget_s: float = 1.0) -> CaseFn:
             while time.perf_counter_ns() - start < budget_ns:
                 chunk = " ".join(
                     f"contact {i} is {address(i)};"
-                    for i in range(minted, minted + _COLD_SLICE)
+                    for i in range(minted, minted + _DRIP_SLICE)
                 )
                 tokenize(chunk, store)
-                minted += _COLD_SLICE
+                minted += _DRIP_SLICE
             elapsed = time.perf_counter_ns() - start
         return Sample(
             total_ms=elapsed / 1e6,
@@ -370,8 +462,49 @@ def case_mint_rate(budget_s: float = 1.0) -> CaseFn:
             io=io,
             notes={
                 "budget_s": budget_s,
+                "per_call": _DRIP_SLICE,
                 "map_entries": len(store),
                 "map_bytes": store.path.stat().st_size if store.path.exists() else 0,
+            },
+        )
+
+    return run
+
+
+def case_mint_rate_bulk(budget_s: float = 1.0) -> CaseFn:
+    """New addresses per second when they arrive in one call, not many.
+
+    The shape a bulk tool result actually has, and what batching was built for:
+    one save covers every address in the call. Sized from a probe so the call is
+    large enough to fill the budget without overshooting it badly.
+    """
+
+    def run(workdir: Path) -> Sample:
+        probe = TokenStore(path=workdir / "probe.json")
+        probe_text = " ".join(
+            f"p{i} is probe.{i:06d}@probe.example.com;" for i in range(_PROBE_SIZE)
+        )
+        start = time.perf_counter_ns()
+        tokenize(probe_text, probe)
+        per_value_ms = (time.perf_counter_ns() - start) / 1e6 / _PROBE_SIZE
+        # Cap at MAX_ENTRIES: past it `token_for` returns the capped placeholder
+        # and stops storing, which would measure the cap rather than minting.
+        count = max(_PROBE_SIZE, min(MAX_ENTRIES, int(budget_s * 1e3 / max(per_value_ms, 1e-6))))
+
+        store = TokenStore(path=workdir / "tokens.json")
+        text = " ".join(f"contact {i} is {address(i)};" for i in range(count))
+        with _counting_io() as io:
+            start = time.perf_counter_ns()
+            tokenize(text, store)
+            elapsed = time.perf_counter_ns() - start
+        return Sample(
+            total_ms=elapsed / 1e6,
+            ops=count,
+            io=io,
+            notes={
+                "budget_s": budget_s,
+                "single_call_addresses": count,
+                "map_entries": len(store),
             },
         )
 
@@ -771,20 +904,27 @@ def build_cases(quick: bool, deadline_s: float) -> dict[str, CaseFn]:
     ones that matter on slow storage, so it is for iterating on the harness
     rather than for a rung of the ladder.
 
-    The three ``*_rate`` cases come first because they are the ones that answer
-    the original question — how many addresses a second — and they are bounded by
-    construction, so they produce a comparable number on every rung even where a
-    fixed-size case gives up at its deadline.
+    The ``*_rate`` cases come first because they answer the original question —
+    how many addresses a second — and they are bounded by construction, so they
+    produce a comparable number on every rung.
+
+    Minting appears twice on purpose. ``mint_rate_1s`` fills its budget with many
+    small calls and ``mint_rate_bulk_1s`` uses one large call; since ``tokenize``
+    saves once per call, the two differ by ~40x on the same host. Reporting only
+    one would misstate the engine in whichever direction that one was chosen.
     """
     big = [] if quick else [10_000]
     cases: dict[str, CaseFn] = {}
 
     cases["mint_rate_1s"] = case_mint_rate(1.0)
+    cases["mint_rate_bulk_1s"] = case_mint_rate_bulk(1.0)
     cases["warm_rate_1s"] = case_warm_rate(1.0)
     cases["detokenize_rate_1s"] = case_detokenize_rate(1.0)
 
     for n in [1, 10, 100, 1_000, *big]:
         cases[f"tool_result_cold_{n}"] = case_tool_result_cold(n, deadline_s)
+    for n in [1_000, *big]:
+        cases[f"mint_drip_{n}"] = case_mint_drip(n, deadline_s)
     for n in [100, 1_000, *big]:
         cases[f"tool_result_warm_{n}"] = case_tool_result_warm(n)
     cases["user_text_warm"] = case_user_text_warm()
