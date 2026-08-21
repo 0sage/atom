@@ -4,12 +4,13 @@ Use this page when the first reply fails because of provider/model mismatch, or 
 
 For a first local setup, `atom onboard --wizard` adds provider credentials, creates a model preset, and selects the active model. Use the JSON below for manual deployments, local endpoints, provider-specific fields, or diagnosis.
 
-atom ships four providers:
+atom ships five providers:
 
 | Provider | Backend | Credential |
 |---|---|---|
 | `anthropic` | Native Anthropic Messages API | `apiKey`, optional `apiBase` override |
 | `openai` | OpenAI Chat Completions / Responses | `apiKey`, optional `apiBase` override |
+| `openai-codex` | OpenAI Responses via the Codex endpoint | ChatGPT sign-in, no `apiKey` — see [OpenAI Codex](#openai-codex) |
 | `groq` | OpenAI-compatible | `apiKey`; also the default voice-transcription provider |
 | `custom` | OpenAI-compatible | `apiBase` required, `apiKey` optional |
 
@@ -191,6 +192,42 @@ To send OpenAI traffic through a proxy, gateway, or regional endpoint, set `apiB
 
 `providers.openai.apiType` may be set when you need to force a specific OpenAI API surface (`chat_completions` or `responses`). Other providers reject `apiType`; leave it unset outside `providers.openai`. Replace the model with a model ID available to your OpenAI account. Direct OpenAI Responses models use [opaque Responses state retention](./configuration.md#responses-state-and-compaction); native compaction is enabled only where the backend supports it. Provider-native features such as OpenAI web search are configured through raw provider request fields under `extraBody`.
 
+### OpenAI Codex
+
+Runs turns against your ChatGPT subscription instead of an API key, using the same OAuth flow the Codex CLI uses. Sign in once:
+
+```bash
+atom auth login openai-codex
+```
+
+The browser opens, you approve, and the credential is stored at `~/.atom/auth/codex.json` with owner-only permissions. `atom auth status openai-codex` reports whether a credential is present without revealing it; `atom auth logout openai-codex` removes it.
+
+Because there is no API key, `providers.openai_codex` needs no credential field — an empty block is enough, and you may omit it entirely:
+
+```json
+{
+  "modelPresets": {
+    "primary": {
+      "provider": "openai_codex",
+      "model": "openai-codex/gpt-5.6-sol",
+      "maxTokens": 8192,
+      "contextWindowTokens": 372000
+    }
+  },
+  "agents": {
+    "defaults": {
+      "modelPreset": "primary"
+    }
+  }
+}
+```
+
+Models: `openai-codex/gpt-5.6-sol` (frontier), `openai-codex/gpt-5.6-terra` (balanced), `openai-codex/gpt-5.6-luna` (fast). The `openai-codex/` prefix is required — it is what routes the model here rather than to `openai`. A bare `gpt-*` model still belongs to the API-key `openai` provider, and this provider is never chosen as a blind fallback.
+
+This provider is hidden from `atom onboard` because there is no key to prompt for; `atom auth login` is its setup path. It uses [opaque Responses state retention](./configuration.md#responses-state-and-compaction) with the Codex backend's own inline compaction. `proxy`, `extraBody`, and `extraHeaders` are supported; `apiKey`, `apiBase`, and `apiType` are not used.
+
+If atom has no credential of its own but the Codex CLI does, the token in `~/.codex/auth.json` is imported automatically. That is also the recovery path when a refresh fails because OAuth refresh tokens are single-use and the CLI already consumed the current one. `atom auth logout` never touches the CLI's file.
+
 ### Groq
 
 Groq is an OpenAI-compatible endpoint and also the default backend for voice transcription.
@@ -307,7 +344,7 @@ If you have more than one OpenAI-compatible endpoint, give each one its own prov
 }
 ```
 
-Custom provider keys are treated as direct OpenAI-compatible providers. `apiBase` is required because atom cannot know the endpoint URL. `apiKey` is optional for local servers or private proxies that do not require one. Choose a name that does not conflict with a built-in provider name, in any capitalization: `anthropic`, `openai`, `groq`, or `custom`. Do not set `apiType` on custom provider keys; `apiType` is only for `providers.openai`.
+Custom provider keys are treated as direct OpenAI-compatible providers. `apiBase` is required because atom cannot know the endpoint URL. `apiKey` is optional for local servers or private proxies that do not require one. Choose a name that does not conflict with a built-in provider name, in any capitalization: `anthropic`, `openai`, `openai_codex`, `groq`, or `custom`. Do not set `apiType` on custom provider keys; `apiType` is only for `providers.openai`.
 
 If your custom endpoint documents a nonstandard thinking toggle, set `providers.<name>.thinkingStyle` to `thinking_type`, `enable_thinking`, or `reasoning_split`; atom then maps `reasoningEffort` onto that provider-specific request body. Leave it unset for ordinary OpenAI-compatible endpoints.
 
@@ -459,7 +496,7 @@ If `atom agent -m "Hello!"` fails:
 | 401, unauthorized, invalid API key | Key is missing, expired, copied with whitespace, or stored under the wrong provider |
 | model not found | Model ID does not exist for the selected provider |
 | connection refused | Local server is not running or `apiBase` points to the wrong port |
-| provider not found | The active preset uses a misspelled provider; use registry names `anthropic`, `openai`, `groq`, or `custom` |
+| provider not found | The active preset uses a misspelled provider; use registry names `anthropic`, `openai`, `openai_codex`, `groq`, or `custom` |
 | requires api_base in config | A `custom` or named custom provider is missing `apiBase` |
 | works in CLI but not chat app | Provider is fine; debug gateway/channel setup in [`chat-apps.md`](./chat-apps.md) or [`troubleshooting.md`](./troubleshooting.md) |
 

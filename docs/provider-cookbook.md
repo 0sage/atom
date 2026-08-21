@@ -16,6 +16,7 @@ Match the recipe to the credential or endpoint you already have:
 |---|---|---|
 | An Anthropic API key and Anthropic model ID | [Anthropic Direct](#recipe-anthropic-direct) | `ANTHROPIC_API_KEY`, `provider: "anthropic"`, and an Anthropic model ID |
 | An OpenAI platform API key and OpenAI model ID | [OpenAI Direct](#recipe-openai-direct) | `OPENAI_API_KEY`, `provider: "openai"`, and an OpenAI model available to that account |
+| A ChatGPT subscription and no API key | [OpenAI Codex](#recipe-openai-codex) | `atom auth login openai-codex`, `provider: "openai_codex"`, and an `openai-codex/` model |
 | A Groq API key | [Groq](#recipe-groq) | `GROQ_API_KEY`, `provider: "groq"`, and a Groq model ID |
 | An OpenAI-compatible `/v1` endpoint that is not a built-in provider | [Custom OpenAI-Compatible Provider](#recipe-custom-openai-compatible-provider) | `apiBase`, optional API key, and the model ID served by that endpoint |
 | A local OpenAI-compatible server (Ollama, vLLM, LM Studio) | [Local OpenAI-Compatible Server](#recipe-local-openai-compatible-server) | Local `/v1` base URL, any required key, and served model name |
@@ -122,6 +123,45 @@ OPENAI_API_KEY="sk-..." atom agent -m "Hello!"
 ```
 
 If your shell cannot use inline environment variables, set `OPENAI_API_KEY` first and then run `atom agent -m "Hello!"`. `apiType` is only valid on `providers.openai`; remove it unless you are forcing a documented OpenAI API surface (`chat_completions` or `responses`).
+
+## Recipe: OpenAI Codex
+
+This recipe applies when you have a ChatGPT subscription whose plan covers Codex, and no OpenAI API key. Turns run against the subscription using the same OAuth flow the Codex CLI uses.
+
+Sign in first — there is no key to put in the config:
+
+```bash
+atom auth login openai-codex
+```
+
+```json
+{
+  "modelPresets": {
+    "primary": {
+      "label": "Codex",
+      "provider": "openai_codex",
+      "model": "openai-codex/gpt-5.6-sol",
+      "maxTokens": 8192,
+      "contextWindowTokens": 372000,
+      "temperature": 0.1
+    }
+  },
+  "agents": {
+    "defaults": {
+      "modelPreset": "primary"
+    }
+  }
+}
+```
+
+Verify:
+
+```bash
+atom auth status openai-codex
+atom agent -m "Hello!"
+```
+
+Must match: the `openai-codex/` model prefix is required, and `provider` is spelled `openai_codex` (the config key) while the model prefix is spelled `openai-codex`. Models are `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. There is no `providers.openai_codex.apiKey` — leave the block out entirely, or use it only for `proxy`, `extraBody`, or `extraHeaders`. If the first reply fails with HTTP 401, the credential was rejected: run `atom auth login openai-codex` again.
 
 ## Recipe: Groq
 
@@ -238,7 +278,7 @@ For multiple custom endpoints, do not overload the single `custom` block. Name e
 }
 ```
 
-These custom names behave like direct OpenAI-compatible providers: `apiBase` is required, `apiKey` is optional when the endpoint allows anonymous or placeholder credentials, and `apiType` should be left unset. Pick a name that does not collide with a built-in provider name in any capitalization (`anthropic`, `openai`, `groq`, `custom`) — atom rejects the config if it does. They do not support Anthropic-compatible endpoints; use the `anthropic` provider with `apiBase` for that case.
+These custom names behave like direct OpenAI-compatible providers: `apiBase` is required, `apiKey` is optional when the endpoint allows anonymous or placeholder credentials, and `apiType` should be left unset. Pick a name that does not collide with a built-in provider name in any capitalization (`anthropic`, `openai`, `openai_codex`, `groq`, `custom`) — atom rejects the config if it does. They do not support Anthropic-compatible endpoints; use the `anthropic` provider with `apiBase` for that case.
 
 If your endpoint documents a nonstandard thinking toggle, set `providers.<name>.thinkingStyle` to `thinking_type`, `enable_thinking`, or `reasoning_split` so `reasoningEffort` maps onto that provider's request body.
 
@@ -503,9 +543,10 @@ turn keeps using the model it started with.
 | `model not found` | The model ID does not belong to the selected provider | Compare `modelPresets.<name>.provider` and `modelPresets.<name>.model` |
 | `connection refused` | Local server is not running or `apiBase` has the wrong port/path | Run `curl <apiBase>/models` |
 | `requires api_base in config` | A `custom` or named custom provider has no `apiBase` | Add the full base URL including any version path |
-| `provider not found` | Provider name is misspelled or uses the config key instead of the registry name | Use `anthropic`, `openai`, `groq`, or `custom` |
+| `provider not found` | Provider name is misspelled or uses the config key instead of the registry name | Use `anthropic`, `openai`, `openai_codex`, `groq`, or `custom` |
 | `conflicts with built-in provider` | A named custom provider reuses a built-in name | Rename the custom key to something unique |
 | `proxy is only supported for` | `proxy` was set on `anthropic` | Use `apiBase` instead |
+| `401` on `openai_codex` | The ChatGPT credential expired or was revoked | Run `atom auth login openai-codex`, then `atom auth status openai-codex` |
 | Langfuse shows no traces | Env vars are missing, `langfuse` is not installed in the active Python environment, or the provider path is native | Run `python -m pip show langfuse` and restart atom from the same environment |
 
 ## Next References

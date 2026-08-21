@@ -252,6 +252,7 @@ class ProvidersConfig(Base):
     custom: ProviderConfig = Field(default_factory=ProviderConfig)  # Any OpenAI-compatible endpoint
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)  # apiBase overrides the default endpoint
     openai: ProviderConfig = Field(default_factory=ProviderConfig)  # apiBase overrides the default endpoint
+    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # ChatGPT OAuth; no apiKey
     groq: ProviderConfig = Field(default_factory=ProviderConfig)  # Groq — Whisper voice transcription and chat
 
     @model_validator(mode="after")

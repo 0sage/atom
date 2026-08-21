@@ -47,7 +47,7 @@ class ProviderSpec:
     settings_alias_for: str = ""  # compatibility alias grouped under this provider in Settings
 
     # which provider implementation to use
-    # "openai_compat" | "anthropic"
+    # "openai_compat" | "anthropic" | "openai_codex"
     backend: str = "openai_compat"
 
     # extra env vars / request headers supplied by the provider integration.
@@ -167,6 +167,38 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         display_name="OpenAI",
         backend="openai_compat",
         supports_max_completion_tokens=True,
+    ),
+    # OpenAI Codex: ChatGPT OAuth credential, no API key. Listed after "openai"
+    # so a bare "gpt-*" model keeps routing to the API-key provider; Codex is
+    # reached through its explicit "openai-codex/" model prefix.
+    ProviderSpec(
+        name="openai_codex",
+        keywords=("openai-codex",),
+        env_key="",
+        display_name="OpenAI Codex",
+        backend="openai_codex",
+        model_catalog="builtin",
+        builtin_models=(
+            ProviderModelSpec(
+                id="openai-codex/gpt-5.6-sol",
+                label="GPT-5.6-Sol",
+                description="Frontier agentic coding model.",
+                context_window=372000,
+            ),
+            ProviderModelSpec(
+                id="openai-codex/gpt-5.6-terra",
+                label="GPT-5.6-Terra",
+                description="Balanced agentic coding model for everyday work.",
+                context_window=372000,
+            ),
+            ProviderModelSpec(
+                id="openai-codex/gpt-5.6-luna",
+                label="GPT-5.6-Luna",
+                description="Fast, lower-cost agentic coding model.",
+                context_window=372000,
+            ),
+        ),
+        is_oauth=True,
     ),
     # === Auxiliary (not a primary LLM provider) ============================
     # Groq: used for Whisper voice transcription, also usable for LLM chat

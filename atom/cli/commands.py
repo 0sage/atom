@@ -4,6 +4,7 @@
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -480,6 +481,157 @@ def channels_login(
 
 
 # ============================================================================
+# Provider Auth Commands
+# ============================================================================
+
+auth_app = typer.Typer(help="Manage OAuth credentials for providers")
+app.add_typer(auth_app, name="auth")
+
+# Providers reachable through `atom auth`. OAuth providers are hidden from
+# onboarding (they have no API key to prompt for), so this is their entry point.
+_OAUTH_PROVIDER_ALIASES = {
+    "openai-codex": "openai_codex",
+    "openai_codex": "openai_codex",
+    "codex": "openai_codex",
+}
+
+
+def _resolve_oauth_provider(name: str) -> str:
+    """Map a user-supplied provider name onto a registry name, or exit."""
+    resolved = _OAUTH_PROVIDER_ALIASES.get(name.strip().lower())
+    if resolved is None:
+        available = ", ".join(sorted({v.replace("_", "-") for v in _OAUTH_PROVIDER_ALIASES.values()}))
+        console.print(f"[red]Unknown OAuth provider: {name}[/red]  Available: {available}")
+        raise typer.Exit(1)
+    return resolved
+
+
+@auth_app.command("login")
+def auth_login(
+    provider: str = typer.Argument(..., help="Provider name (e.g. openai-codex)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Sign in to an OAuth provider in the browser."""
+    _resolve_oauth_provider(provider)
+    _load_inspection_config(config=config)
+
+    from oauth_cli_kit import login_oauth_interactive
+    from oauth_cli_kit.providers import OPENAI_CODEX_PROVIDER
+
+    from atom.providers.openai_codex_auth import CodexTokenStorage, codex_token_path
+    from atom.providers.openai_codex_provider import CODEX_ORIGINATOR
+
+    console.print(f"{__logo__} OpenAI Codex Login\n")
+    console.print("[dim]Sign in with the ChatGPT account whose plan covers Codex.[/dim]\n")
+
+    try:
+        login_oauth_interactive(
+            print_fn=lambda text: console.print(text),
+            prompt_fn=lambda text: typer.prompt(text),
+            provider=OPENAI_CODEX_PROVIDER,
+            originator=CODEX_ORIGINATOR,
+            storage=CodexTokenStorage(),
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Login cancelled.[/yellow]")
+        raise typer.Exit(1) from None
+    except Exception as exc:
+        # Never surface the exception payload: a failed token exchange can echo
+        # the authorization code back in its body.
+        console.print(f"[red]✗ Login failed ({type(exc).__name__}).[/red]")
+        console.print("[dim]Check the pasted callback URL and try again.[/dim]")
+        raise typer.Exit(1) from None
+
+    console.print("\n[green]✓ Signed in.[/green]")
+    console.print(f"[dim]Credential stored at {codex_token_path()}[/dim]")
+    console.print('Next: [cyan]atom agent -m "Hello!" --model openai-codex/gpt-5.6-sol[/cyan]')
+
+
+@auth_app.command("status")
+def auth_status(
+    provider: str = typer.Argument("openai-codex", help="Provider name (e.g. openai-codex)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Show whether an OAuth credential is stored, without revealing it."""
+    _resolve_oauth_provider(provider)
+    _load_inspection_config(config=config)
+
+    from atom.providers.openai_codex_auth import codex_token_status
+
+    status_info = codex_token_status()
+    console.print(f"{__logo__} OpenAI Codex Credential\n")
+    console.print(f"Store: {status_info['path']}")
+
+    if not status_info.get("configured"):
+        console.print("Status: [dim]not signed in[/dim]")
+        console.print("Sign in: [cyan]atom auth login openai-codex[/cyan]")
+        return
+
+    if not status_info.get("valid"):
+        console.print("Status: [red]✗ stored credential is unreadable or incomplete[/red]")
+        console.print("Sign in again: [cyan]atom auth login openai-codex[/cyan]")
+        return
+
+    console.print("Status: [green]✓ signed in[/green]")
+    if status_info.get("source") == "codex_cli":
+        console.print(f"Source: Codex CLI ({status_info.get('cli_path')})")
+        console.print(
+            "[dim]atom has no credential of its own yet; this one is imported on "
+            "first use. Run `atom auth login openai-codex` for an independent one.[/dim]"
+        )
+    _print_codex_expiry(status_info)
+    mode = status_info.get("mode")
+    if isinstance(mode, int) and mode & 0o077:
+        console.print(f"[yellow]⚠ File mode is {mode:04o}; expected 0600.[/yellow]")
+    console.print(
+        "[dim]Status reads local state only; it does not contact the Codex API.[/dim]"
+    )
+
+
+def _print_codex_expiry(status_info: dict[str, Any]) -> None:
+    """Report access-token freshness. Expiry is not a problem — it auto-refreshes."""
+    expires_ms = status_info.get("expires_ms")
+    if not isinstance(expires_ms, int):
+        return
+    remaining_s = expires_ms / 1000 - time.time()
+    if remaining_s > 0:
+        console.print(f"Access token: valid for {int(remaining_s // 60)} min")
+    else:
+        console.print("Access token: [dim]expired; refreshes on next use[/dim]")
+
+
+@auth_app.command("logout")
+def auth_logout(
+    provider: str = typer.Argument(..., help="Provider name (e.g. openai-codex)"),
+    config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+):
+    """Delete a stored OAuth credential."""
+    _resolve_oauth_provider(provider)
+    _load_inspection_config(config=config)
+
+    from atom.providers.openai_codex_auth import (
+        clear_codex_token,
+        codex_cli_credential_available,
+    )
+
+    removed = clear_codex_token()
+    console.print(
+        "[green]✓ Credential removed.[/green]"
+        if removed
+        else "[dim]No atom credential to remove.[/dim]"
+    )
+    # Removing atom's store does not sign the provider out while the Codex CLI
+    # still holds a credential — the next call imports it again. Say so rather
+    # than letting "removed" imply access is gone.
+    if codex_cli_credential_available():
+        console.print(
+            "[yellow]Note: the Codex CLI credential in ~/.codex/auth.json is left "
+            "untouched, and atom will import it again on next use.[/yellow]"
+        )
+        console.print("[dim]To sign out fully, remove that file or run `codex logout`.[/dim]")
+
+
+# ============================================================================
 # Plugin Commands
 # ============================================================================
 
@@ -639,6 +791,21 @@ def upgrade(
 # ============================================================================
 
 
+def _oauth_provider_status(provider_name: str) -> str:
+    """Describe an OAuth provider's stored credential for `atom status`."""
+    if provider_name != "openai_codex":
+        return "[dim]not set[/dim]"
+
+    from atom.providers.openai_codex_auth import codex_token_status
+
+    info = codex_token_status()
+    if not info.get("configured"):
+        return "[dim]not signed in[/dim]"
+    if not info.get("valid"):
+        return "[red]✗ credential unreadable[/red]"
+    return "[green]✓ signed in[/green]"
+
+
 @app.command()
 def status(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
@@ -687,6 +854,10 @@ def status(
         for spec in PROVIDERS:
             p = getattr(loaded.providers, spec.name, None)
             if p is None:
+                continue
+            if spec.is_oauth:
+                # No API key to inspect; report stored-credential presence instead.
+                console.print(f"{spec.label}: {_oauth_provider_status(spec.name)}")
                 continue
             has_key = bool(resolve_env_refs(p.api_key or ""))
             console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")

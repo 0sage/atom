@@ -222,12 +222,14 @@ Tracing covers the providers that go through atom's OpenAI-compatible client pat
 > - **Base URL overrides**: `providers.anthropic.apiBase` and `providers.openai.apiBase` point a built-in provider at a proxy, gateway, or regional endpoint while keeping its native request format. For Anthropic a trailing `/v1` is normalized away.
 > - **Custom OpenAI-compatible providers**: Besides the built-in `custom` provider, any extra key under `providers` can define its own OpenAI-compatible endpoint. For example, `providers.companyProxy.apiBase` plus `modelPresets.primary.provider: "companyProxy"` creates a separate custom provider. Set `apiBase`; set `apiKey` only when the endpoint requires it. The name must not collide with a built-in provider name in any capitalization. This named-custom path uses the OpenAI-compatible request format only. For Anthropic-compatible proxies, use `providers.anthropic.apiBase` with `provider: "anthropic"`.
 > - **Local model servers**: Ollama, LM Studio, vLLM, and similar local servers are configured through `custom` (or a named custom key) with `apiBase` pointing at the local port. See [Local model servers](#local-providers).
-> - **Provider-scoped proxy**: `providers.<name>.proxy` routes only that provider through an HTTP proxy. It is supported for the OpenAI-compatible providers (`openai`, `groq`, `custom`, named custom keys). The native `anthropic` backend rejects `proxy`; use `providers.anthropic.apiBase` instead.
+> - **Provider-scoped proxy**: `providers.<name>.proxy` routes only that provider through an HTTP proxy. It is supported for the OpenAI-compatible providers (`openai`, `groq`, `custom`, named custom keys) and for `openai_codex`, where it also covers the OAuth token exchange. The native `anthropic` backend rejects `proxy`; use `providers.anthropic.apiBase` instead.
+> - **OAuth providers**: `openai_codex` has no `apiKey`. Sign in with `atom auth login openai-codex`; the credential is stored at `~/.atom/auth/codex.json` with owner-only permissions, and `apiBase` / `apiType` are unused. See [Providers and Models](./providers.md#openai-codex).
 
 | Provider | Purpose | Get API Key |
 |----------|---------|-------------|
 | `anthropic` | LLM (Claude direct, native Messages API, prompt caching) | [console.anthropic.com](https://console.anthropic.com) |
 | `openai` | LLM (Chat Completions / Responses) + Voice transcription (Whisper) | [platform.openai.com](https://platform.openai.com) |
+| `openai_codex` | LLM (Responses via the Codex endpoint, ChatGPT subscription) | No API key — `atom auth login openai-codex` |
 | `groq` | LLM + Voice transcription (Whisper, default) | [console.groq.com](https://console.groq.com) |
 | `custom` | Any OpenAI-compatible endpoint, including local servers | — |
 

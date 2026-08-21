@@ -73,7 +73,7 @@ def _resolve_provider_setup(
     if spec and spec.is_transcription_only:
         raise ValueError(f"Provider '{provider_name}' only supports transcription.")
     backend = spec.backend if spec else "openai_compat"
-    if p and p.proxy and backend != "openai_compat":
+    if p and p.proxy and backend not in {"openai_compat", "openai_codex"}:
         raise ValueError(
             f"providers.{provider_name}.proxy is only supported for "
             "OpenAI-compatible providers."
@@ -143,6 +143,15 @@ def _make_provider_core(
             api_key=p.api_key if p else None,
             api_base=config.get_api_base(model, preset=preset),
             default_model=model,
+            extra_headers=_provider_extra_headers(spec, p),
+        )
+    elif backend == "openai_codex":
+        from atom.providers.openai_codex_provider import OpenAICodexProvider
+
+        provider = OpenAICodexProvider(
+            default_model=model,
+            proxy=p.proxy if p else None,
+            extra_body=p.extra_body if p else None,
             extra_headers=_provider_extra_headers(spec, p),
         )
     else:

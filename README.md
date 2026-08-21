@@ -9,8 +9,9 @@
 your terminal or in Telegram, and keeps a small readable core: an agent loop, a
 provider layer, tools, session memory, and a gateway process.
 
-Linux and macOS, Python 3.11+. Providers: `anthropic`, `openai`, `groq`, and any
-OpenAI-compatible endpoint via `custom`. A trimmed fork of
+Linux and macOS, Python 3.11+. Providers: `anthropic`, `openai`, `openai-codex`
+(ChatGPT sign-in, no API key), `groq`, and any OpenAI-compatible endpoint via
+`custom`. A trimmed fork of
 [HKUDS/nanobot](https://github.com/HKUDS/nanobot), [MIT](./LICENSE) licensed.
 
 ## Install

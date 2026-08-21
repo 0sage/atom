@@ -107,7 +107,7 @@ Common config mistakes:
 | Symptom | Check |
 |---|---|
 | JSON parse error | Validate commas, braces, and quotes. Most docs examples are partial snippets to merge. |
-| Unknown or missing provider | Use a provider registry name (`anthropic`, `openai`, `groq`, `custom`), or define your own OpenAI-compatible provider key under `providers` and reference that exact key from the active preset. |
+| Unknown or missing provider | Use a provider registry name (`anthropic`, `openai`, `openai_codex`, `groq`, `custom`), or define your own OpenAI-compatible provider key under `providers` and reference that exact key from the active preset. |
 | snake_case vs camelCase confusion | Both are accepted, but docs use camelCase because atom writes config with aliases such as `apiKey`, `modelPresets`, `intervalS`. |
 | Environment variable error | `${VAR_NAME}` references are resolved at startup. Set the variable before running atom. |
 | Edited config but behavior did not change | Restart `atom gateway`; long-running processes read config at startup. |
